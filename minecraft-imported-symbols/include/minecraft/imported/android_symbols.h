@@ -85,7 +85,7 @@ static const char* android_symbols[] = {
         "mknod",
         "mknodat",
         "mkstemp",
-        "nullptr"
+        "nullptr",
         "openat",
         "pipe2",
         "posix_fadvise",

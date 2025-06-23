@@ -2576,5 +2576,7 @@ static const char * android_symbols[] = {
   "Java_com_xbox_httpclient_NetworkObserver_Log",
   "Java_com_mojang_minecraftpe_PlayIntegrity_nativePlayIntegrityComplete",
   "evt_api_call_default",
+  "_ZTVN9Microsoft12Applications6Events16DebugEventSourceE",
+  "_ZTV21AppPlatform_android23",
   nullptr
 };

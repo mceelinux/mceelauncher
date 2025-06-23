@@ -11,6 +11,7 @@
 #include <minecraft/imported/fmod_symbols.h>
 #include <minecraft/imported/glesv2_symbols.h>
 #include <minecraft/imported/libz_symbols.h>
+#include <minecraft/imported/maesdk_symbols.h>
 #include <log.h>
 #include <FileUtil.h>
 #include <mcpelauncher/linker.h>

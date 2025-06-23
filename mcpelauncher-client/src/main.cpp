@@ -27,6 +27,7 @@
 #include <libc_shim.h>
 #include <mcpelauncher/linker.h>
 #include <minecraft/imported/android_symbols.h>
+#include <minecraft/imported/maesdk_symbols.h>
 #include "main.h"
 #ifdef HAVE_SDL3AUDIO
 #include "fake_audio.h"

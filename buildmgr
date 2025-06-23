@@ -1,7 +1,13 @@
 #!/bin/bash
 
+PROJECT="$(cat project/name.txt)"
+OPTIONS="""
+build - Build ${PROJECT}
+clean - Remove old build of ${PROJECT}
+"""
+
 clear
-echo "$(cat project/name.txt) buildsystem"
+echo "${PROJECT} buildsystem"
 
 if [[ $1 == "build" ]]; then 
 	echo "Build"
@@ -14,5 +20,5 @@ elif [[ $1 == "clean" ]]; then
 	echo "Clean"
 	rm -r build
 else
-	echo "No valid option found"
+	echo "${OPTIONS}"
 fi

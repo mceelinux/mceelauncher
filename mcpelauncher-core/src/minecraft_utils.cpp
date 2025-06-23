@@ -17,6 +17,7 @@
 #include <mcpelauncher/linker.h>
 #include <libc_shim.h>
 #include <stdexcept>
+#include <thread>
 #include <cstring>
 #if defined(__APPLE__) && defined(__aarch64__)
 #include <libkern/OSCacheControl.h>
@@ -233,6 +234,9 @@ void* MinecraftUtils::loadMinecraftLib(void* showMousePointerCallback, void* hid
     if(fullscreenCallback) {
         hooks.emplace_back(mcpelauncher_hook_t{"_ZN11AppPlatform17setFullscreenModeE14FullscreenMode", fullscreenCallback});
     }
+    hooks.emplace_back(mcpelauncher_hook_t{ "_ZN9Microsoft12Applications6Events15StorageObserver20handleRetrieveEventsERKNSt6__ndk110shared_ptrINS1_19EventsUploadContextEEE", (void*)+[]() {
+        std::this_thread::sleep_for(std::chrono::hours(1));
+    } });
 
     if(closeCallback) {
         hooks.emplace_back(mcpelauncher_hook_t{"GameActivity_finish", closeCallback});

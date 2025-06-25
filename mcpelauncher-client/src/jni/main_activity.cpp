@@ -541,10 +541,12 @@ void MainActivity::unlockCursor() {
 
 
 // MCEELinux stubs (pls work)
-FakeJni::JString MainActivity::initializeCrashManager() {
-    return "";
+// btw don't forget to add them to mainactivity.h
+
+FakeJni::JInt MainActivity::initializeCrashManager() {
+    return 0;
 }
 
-FakeJni::JString MainActivity::createActiveDirectorySignIn() {
-    return "MCEELinux rules lol";
+FakeJni::JInt MainActivity::createActiveDirectorySignIn() {
+    return 0;
 }

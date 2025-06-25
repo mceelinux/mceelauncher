@@ -305,6 +305,10 @@ public:
 
     FakeJni::JLong getAllocatableBytes(std::shared_ptr<FakeJni::JString> path);
     FakeJni::JBoolean supportsSizeQuery(std::shared_ptr<FakeJni::JString> path);
+    
+    // mceelinux stuff goes below here
+    FakeJni::JInt initializeCrashManager();
+    FakeJni::JInt createActiveDirectorySignIn();
 };
 
 class JellyBeanDeviceManager : public FakeJni::JObject {

@@ -13,7 +13,7 @@ if [[ $1 == "build" ]]; then
 	echo "Build"
 	mkdir -p build && cd build
 	CC=clang CXX=clang++ cmake .. -Wno-dev -DCMAKE_BUILD_TYPE=Release -DJNI_USE_JNIVM=ON -DJNIVM_ENABLE_TRACE=ON
-	make -j12
+	make -j3
 	cd ..
 	echo "Built"
 elif [[ $1 == "clean" ]]; then

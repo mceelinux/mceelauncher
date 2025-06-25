@@ -538,3 +538,13 @@ void MainActivity::lockCursor() {
 void MainActivity::unlockCursor() {
     CorePatches::showMousePointer();
 }
+
+
+// MCEELinux stubs (pls work)
+FakeJni::JString MainActivity::initializeCrashManager() {
+    return "";
+}
+
+FakeJni::JString MainActivity::createActiveDirectorySignIn() {
+    return "MCEELinux rules lol";
+}

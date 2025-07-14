@@ -436,7 +436,7 @@ void ImGuiUIDrawFrame(GameWindow* window) {
                 window->close();
             }
             ImGui::EndMenu();
-        }
+        }/*
         if(ImGui::BeginMenu("Mods")) {
             if(ImGui::MenuItem("Enable Keyboard AutoFocus Patches for 1.20.60+", nullptr, Settings::enable_keyboard_autofocus_patches_1_20_60)) {
                 Settings::enable_keyboard_autofocus_patches_1_20_60 ^= true;
@@ -457,7 +457,7 @@ void ImGuiUIDrawFrame(GameWindow* window) {
                 menuentrieslock.unlock();
             }
             ImGui::EndMenu();
-        }
+        }*/
         if(ImGui::BeginMenu("View")) {
             if(ImGui::BeginMenu("Show FPS-Hud")) {
                 if(ImGui::MenuItem("None", nullptr, Settings::enable_fps_hud == 0)) {
@@ -588,7 +588,7 @@ void ImGuiUIDrawFrame(GameWindow* window) {
     }
     if(show_about) {
         if(ImGui::Begin("About", &show_about)) {
-            ImGui::Text("mcpelauncher-client %s / manifest %s\n", CLIENT_GIT_COMMIT_HASH, MANIFEST_GIT_COMMIT_HASH);
+            ImGui::Text("mceelauncher-client %s / manifest %s\n (borked-as-usual-because-i-am-a-failure)", CLIENT_GIT_COMMIT_HASH, MANIFEST_GIT_COMMIT_HASH);
 #if defined(__linux__)
 #define TARGET "Linux"
 #elif defined(__APPLE__)

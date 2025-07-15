@@ -200,7 +200,13 @@ template<class T> T jnivm::MDispatchBase2<T>::CallMethod(JNIEnv *env, jobject ob
         auto cl = JNITypes<std::shared_ptr<Class>>::JNICast(ENV::FromJNIEnv(env), env->GetObjectClass(obj));
         mid = findVirtualOverload(ENV::FromJNIEnv(env), cl.get(), mid);
 #ifdef JNI_TRACE
-        LOG("JNIVM", "Call Member Function Class=`%s` Method=`%s` Signature=`%s`", cl ? cl->nativeprefix.data() : "???", mid->name.data(), mid->signature.data());
+
+	// remove because im lazy and need less spam
+	//
+	// if you really must re-enable this stuff just uncomment it
+	// grep rnw for "Re-enable"
+	//
+        //LOG("JNIVM", "Call Member Function Class=`%s` Method=`%s` Signature=`%s`", cl ? cl->nativeprefix.data() : "???", mid->name.data(), mid->signature.data());
 #endif
         try {
             return static_cast<jnivm::impl::MethodHandleBase<T>*>(mid->nativehandle.get())->InstanceInvoke(ENV::FromJNIEnv(env), obj, param, jnivm::impl::MethodHandleBase<T>{});

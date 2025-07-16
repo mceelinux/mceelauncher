@@ -28,32 +28,15 @@
 
 #include "private/__bionic_get_shell_path.h"
 
-#include <errno.h>
-#include <string.h>
-#include <sys/cdefs.h>
 #include <unistd.h>
 
-#define VENDOR_PREFIX "/vendor/"
-
-static const char* init_sh_path() {
-  /* If the device is not treble enabled, return the path to the system shell.
-   * Vendor code, on non-treble enabled devices could use system() / popen()
-   * with relative paths for executables on /system. Since /system will not be
-   * in $PATH for the vendor shell, simply return the system shell.
-   */
-
-#ifdef TREBLE_LINKER_NAMESPACES
-  /* look for /system or /vendor prefix */
-  char exe_path[strlen(VENDOR_PREFIX)];
-  ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path));
-  if (len != -1 && !strncmp(exe_path, VENDOR_PREFIX, strlen(VENDOR_PREFIX))) {
-    return "/vendor/bin/sh";
-  }
-#endif
-  return "/system/bin/sh";
-}
-
 const char* __bionic_get_shell_path() {
-  static const char* sh_path = init_sh_path();
-  return sh_path;
+  // Since API level 28 there's a /bin -> /system/bin symlink that means
+  // /bin/sh will work for the device too, but as long as the NDK supports
+  // earlier API levels, falling back to /system/bin/sh ensures that static
+  // binaries run on those OS versions too.
+  // This whole function can be removed and replaced by hard-coded /bin/sh
+  // when we no longer support anything below API level 28.
+  static bool have_bin_sh = !access("/bin/sh", F_OK);
+  return have_bin_sh ? "/bin/sh" : "/system/bin/sh";
 }

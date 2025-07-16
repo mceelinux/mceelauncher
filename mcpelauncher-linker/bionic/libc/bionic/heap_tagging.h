@@ -28,7 +28,34 @@
 
 #pragma once
 
+#include <bionic/pthread_internal.h>
+#include <platform/bionic/malloc.h>
 #include <stddef.h>
 
+// Expected to be called in a single-threaded context during libc init, so no
+// synchronization required.
 void SetDefaultHeapTaggingLevel();
-bool SetHeapTaggingLevel(void* arg, size_t arg_size);
+
+// Lock for the heap tagging level. You may find ScopedPthreadMutexLocker
+// useful for RAII on this lock.
+extern pthread_mutex_t g_heap_tagging_lock;
+
+// This function can be called in a multithreaded context, and thus should
+// only be called when holding the `g_heap_tagging_lock`.
+bool SetHeapTaggingLevel(HeapTaggingLevel level);
+
+// This is static because libc_nomalloc uses this but does not need to link the
+// cpp file.
+__attribute__((unused)) static inline const char* DescribeTaggingLevel(
+    HeapTaggingLevel level) {
+  switch (level) {
+    case M_HEAP_TAGGING_LEVEL_NONE:
+      return "none";
+    case M_HEAP_TAGGING_LEVEL_TBI:
+      return "tbi";
+    case M_HEAP_TAGGING_LEVEL_ASYNC:
+      return "async";
+    case M_HEAP_TAGGING_LEVEL_SYNC:
+      return "sync";
+  }
+}

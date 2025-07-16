@@ -69,11 +69,12 @@
 #define RWLOCKATTR_KIND_MASK     2
 #define RWLOCKATTR_RESERVED_MASK (~3)
 
-static inline __always_inline __always_inline bool __rwlockattr_getpshared(const pthread_rwlockattr_t* attr) {
+static inline __always_inline bool __rwlockattr_getpshared(const pthread_rwlockattr_t* attr) {
   return (*attr & RWLOCKATTR_PSHARED_MASK) >> RWLOCKATTR_PSHARED_SHIFT;
 }
 
-static inline __always_inline __always_inline void __rwlockattr_setpshared(pthread_rwlockattr_t* attr, int pshared) {
+static inline __always_inline void __rwlockattr_setpshared(pthread_rwlockattr_t* attr,
+                                                           int pshared) {
   *attr = (*attr & ~RWLOCKATTR_PSHARED_MASK) | (pshared << RWLOCKATTR_PSHARED_SHIFT);
 }
 
@@ -246,7 +247,7 @@ int pthread_rwlock_init(pthread_rwlock_t* rwlock_interface, const pthread_rwlock
     }
   }
 
-  atomic_init(&rwlock->state, 0);
+  atomic_store_explicit(&rwlock->state, 0, memory_order_relaxed);
   rwlock->pending_lock.init(rwlock->pshared);
   return 0;
 }

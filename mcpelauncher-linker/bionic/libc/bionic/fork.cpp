@@ -31,29 +31,37 @@
 #include <android/fdsan.h>
 
 #include "private/bionic_defs.h"
+#include "private/bionic_fdtrack.h"
 #include "pthread_internal.h"
 
-__BIONIC_WEAK_FOR_NATIVE_BRIDGE
-int fork() {
-  __bionic_atfork_run_prepare();
-
+__BIONIC_WEAK_FOR_NATIVE_BRIDGE_INLINE
+int __clone_for_fork() {
   pthread_internal_t* self = __get_thread();
 
-  int result = clone(nullptr,
-                     nullptr,
-                     (CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID | SIGCHLD),
-                     nullptr,
-                     nullptr,
-                     nullptr,
-                     &(self->tid));
+  int result = clone(nullptr, nullptr, (CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID | SIGCHLD),
+                     nullptr, nullptr, nullptr, &(self->tid));
+
   if (result == 0) {
-    // Update the cached pid, since clone() will not set it directly (as
+    // Update the cached pid in child, since clone() will not set it directly (as
     // self->tid is updated by the kernel).
     self->set_cached_pid(gettid());
+  }
 
-    // Disable fdsan post-fork, so we don't falsely trigger on processes that
-    // fork, close all of their fds blindly, and then exec.
+  return result;
+}
+
+int _Fork() {
+  return __clone_for_fork();
+}
+
+int fork() {
+  __bionic_atfork_run_prepare();
+  int result = _Fork();
+  if (result == 0) {
+    // Disable fdsan and fdtrack post-fork, so we don't falsely trigger on processes that
+    // fork, close all of their fds, and then exec.
     android_fdsan_set_error_level(ANDROID_FDSAN_ERROR_LEVEL_DISABLED);
+    android_fdtrack_set_globally_enabled(false);
 
     // Reset the stack_and_tls VMA name so it doesn't end with a tid from the
     // parent process.

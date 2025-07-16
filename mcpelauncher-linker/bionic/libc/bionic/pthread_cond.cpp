@@ -116,7 +116,8 @@ struct pthread_cond_internal_t {
   }
 
 #if defined(__LP64__)
-  char __reserved[44];
+  atomic_uint waiters;
+  char __reserved[40];
 #endif
 };
 
@@ -139,7 +140,11 @@ int pthread_cond_init(pthread_cond_t* cond_interface, const pthread_condattr_t* 
   if (attr != nullptr) {
     init_state = (*attr & COND_FLAGS_MASK);
   }
-  atomic_init(&cond->state, init_state);
+  atomic_store_explicit(&cond->state, init_state, memory_order_relaxed);
+
+#if defined(__LP64__)
+  atomic_store_explicit(&cond->waiters, 0, memory_order_relaxed);
+#endif
 
   return 0;
 }
@@ -163,6 +168,12 @@ static int __pthread_cond_pulse(pthread_cond_internal_t* cond, int thread_count)
   // not be called. That's why pthread_wait/signal pair can't be used as a method for memory
   // synchronization. And it doesn't help even if we use any fence here.
 
+#if defined(__LP64__)
+  if (atomic_load_explicit(&cond->waiters, memory_order_relaxed) == 0) {
+    return 0;
+  }
+#endif
+
   // The increase of value should leave flags alone, even if the value can overflows.
   atomic_fetch_add_explicit(&cond->state, COND_COUNTER_STEP, memory_order_relaxed);
 
@@ -178,9 +189,19 @@ static int __pthread_cond_timedwait(pthread_cond_internal_t* cond, pthread_mutex
   }
 
   unsigned int old_state = atomic_load_explicit(&cond->state, memory_order_relaxed);
+
+#if defined(__LP64__)
+  atomic_fetch_add_explicit(&cond->waiters, 1, memory_order_relaxed);
+#endif
+
   pthread_mutex_unlock(mutex);
   int status = __futex_wait_ex(&cond->state, cond->process_shared(), old_state,
                                use_realtime_clock, abs_timeout_or_null);
+
+#if defined(__LP64__)
+  atomic_fetch_sub_explicit(&cond->waiters, 1, memory_order_relaxed);
+#endif
+
   pthread_mutex_lock(mutex);
 
   if (status == -ETIMEDOUT) {
@@ -228,15 +249,18 @@ int pthread_cond_clockwait(pthread_cond_t* cond_interface, pthread_mutex_t* mute
 }
 
 #if !defined(__LP64__)
-// TODO: this exists only for backward binary compatibility on 32 bit platforms.
+// This exists only for backward binary compatibility on 32 bit platforms.
+// (This is actually a _new_ function in API 28 that we could only implement for LP64.)
 extern "C" int pthread_cond_timedwait_monotonic(pthread_cond_t* cond_interface,
                                                 pthread_mutex_t* mutex,
                                                 const timespec* abs_timeout) {
   return pthread_cond_timedwait_monotonic_np(cond_interface, mutex, abs_timeout);
 }
+#endif
 
-// Force this function using CLOCK_MONOTONIC because it was always using
-// CLOCK_MONOTONIC in history.
+#if !defined(__LP64__)
+// This exists only for backward binary compatibility on 32 bit platforms.
+// (This function never existed for LP64.)
 extern "C" int pthread_cond_timedwait_relative_np(pthread_cond_t* cond_interface,
                                                   pthread_mutex_t* mutex,
                                                   const timespec* rel_timeout) {
@@ -248,11 +272,15 @@ extern "C" int pthread_cond_timedwait_relative_np(pthread_cond_t* cond_interface
   }
   return __pthread_cond_timedwait(__get_internal_cond(cond_interface), mutex, false, abs_timeout);
 }
+#endif
 
+#if !defined(__LP64__)
+// This exists only for backward binary compatibility on 32 bit platforms.
+// (This function never existed for LP64.)
 extern "C" int pthread_cond_timeout_np(pthread_cond_t* cond_interface,
                                        pthread_mutex_t* mutex, unsigned ms) {
   timespec ts;
   timespec_from_ms(ts, ms);
   return pthread_cond_timedwait_relative_np(cond_interface, mutex, &ts);
 }
-#endif // !defined(__LP64__)
+#endif

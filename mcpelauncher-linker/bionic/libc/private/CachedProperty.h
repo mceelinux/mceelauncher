@@ -74,9 +74,9 @@ class CachedProperty {
     if (prop_info_ != nullptr) {
       // Only bother re-reading the property if it's actually changed since last time.
       uint32_t property_serial = __system_property_serial(prop_info_);
-      if (property_serial != cached_property_serial_) {
-        __system_property_read_callback(prop_info_, &CachedProperty::Callback, this);
-      }
+      //if (property_serial != cached_property_serial_) {
+      //  __system_property_read_callback(prop_info_, &CachedProperty::Callback, this);
+      //}
     }
     if (is_read_only_ && read_only_property_ != nullptr) {
       return read_only_property_;

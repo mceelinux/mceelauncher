@@ -39,76 +39,114 @@
 __BEGIN_DECLS
 
 /**
- * [__fbufsize(3)](http://man7.org/linux/man-pages/man3/__fbufsize.3.html) returns the size of
+ * [__fbufsize(3)](https://man7.org/linux/man-pages/man3/__fbufsize.3.html) returns the size of
  * the stream's buffer.
  *
  * Available since API level 23.
  */
-size_t __fbufsize(FILE* __fp) __INTRODUCED_IN(23);
+
+#if __BIONIC_AVAILABILITY_GUARD(23)
+size_t __fbufsize(FILE* _Nonnull __fp) __INTRODUCED_IN(23);
 
 /**
- * [__freadable(3)](http://man7.org/linux/man-pages/man3/__freadable.3.html) returns non-zero if
+ * [__freadable(3)](https://man7.org/linux/man-pages/man3/__freadable.3.html) returns non-zero if
  * the stream allows reading, 0 otherwise.
  *
  * Available since API level 23.
  */
-int __freadable(FILE* __fp) __INTRODUCED_IN(23);
+int __freadable(FILE* _Nonnull __fp) __INTRODUCED_IN(23);
+#endif /* __BIONIC_AVAILABILITY_GUARD(23) */
+
 
 /**
- * [__freading(3)](http://man7.org/linux/man-pages/man3/__freading.3.html) returns non-zero if
+ * [__freading(3)](https://man7.org/linux/man-pages/man3/__freading.3.html) returns non-zero if
  * the stream's last operation was a read, 0 otherwise.
  *
  * Available since API level 28.
  */
-int __freading(FILE* __fp) __INTRODUCED_IN(28);
+
+#if __BIONIC_AVAILABILITY_GUARD(28)
+int __freading(FILE* _Nonnull __fp) __INTRODUCED_IN(28);
+#endif /* __BIONIC_AVAILABILITY_GUARD(28) */
+
 
 /**
- * [__fwritable(3)](http://man7.org/linux/man-pages/man3/__fwritable.3.html) returns non-zero if
+ * [__fwritable(3)](https://man7.org/linux/man-pages/man3/__fwritable.3.html) returns non-zero if
  * the stream allows writing, 0 otherwise.
  *
  * Available since API level 23.
  */
-int __fwritable(FILE* __fp) __INTRODUCED_IN(23);
+
+#if __BIONIC_AVAILABILITY_GUARD(23)
+int __fwritable(FILE* _Nonnull __fp) __INTRODUCED_IN(23);
+#endif /* __BIONIC_AVAILABILITY_GUARD(23) */
+
 
 /**
- * [__fwriting(3)](http://man7.org/linux/man-pages/man3/__fwriting.3.html) returns non-zero if
+ * [__fwriting(3)](https://man7.org/linux/man-pages/man3/__fwriting.3.html) returns non-zero if
  * the stream's last operation was a write, 0 otherwise.
  *
  * Available since API level 28.
  */
-int __fwriting(FILE* __fp) __INTRODUCED_IN(28);
+
+#if __BIONIC_AVAILABILITY_GUARD(28)
+int __fwriting(FILE* _Nonnull __fp) __INTRODUCED_IN(28);
+#endif /* __BIONIC_AVAILABILITY_GUARD(28) */
+
 
 /**
- * [__flbf(3)](http://man7.org/linux/man-pages/man3/__flbf.3.html) returns non-zero if
+ * [__flbf(3)](https://man7.org/linux/man-pages/man3/__flbf.3.html) returns non-zero if
  * the stream is line-buffered, 0 otherwise.
  *
  * Available since API level 23.
  */
-int __flbf(FILE* __fp) __INTRODUCED_IN(23);
+
+#if __BIONIC_AVAILABILITY_GUARD(23)
+int __flbf(FILE* _Nonnull __fp) __INTRODUCED_IN(23);
+#endif /* __BIONIC_AVAILABILITY_GUARD(23) */
+
 
 /**
- * [__fpurge(3)](http://man7.org/linux/man-pages/man3/__fpurge.3.html) discards the contents of
+ * [__fpurge(3)](https://man7.org/linux/man-pages/man3/__fpurge.3.html) discards the contents of
  * the stream's buffer.
+ */
+void __fpurge(FILE* _Nonnull __fp) __RENAME(fpurge);
+
+/**
+ * [__fpending(3)](https://man7.org/linux/man-pages/man3/__fpending.3.html) returns the number of
+ * bytes in the output buffer. See __freadahead() for the input buffer.
  *
  * Available since API level 23.
  */
-void __fpurge(FILE* __fp) __INTRODUCED_IN(23);
+
+#if __BIONIC_AVAILABILITY_GUARD(23)
+size_t __fpending(FILE* _Nonnull __fp) __INTRODUCED_IN(23);
+#endif /* __BIONIC_AVAILABILITY_GUARD(23) */
+
 
 /**
- * [__fpending(3)](http://man7.org/linux/man-pages/man3/__fpending.3.html) returns the number of
- * bytes in the output buffer.
+ * __freadahead(3) returns the number of bytes in the input buffer.
+ * See __fpending() for the output buffer.
  *
- * Available since API level 23.
+ * Available since API level 34.
  */
-size_t __fpending(FILE* __fp) __INTRODUCED_IN(23);
+
+#if __BIONIC_AVAILABILITY_GUARD(34)
+size_t __freadahead(FILE* _Nonnull __fp) __INTRODUCED_IN(34);
+#endif /* __BIONIC_AVAILABILITY_GUARD(34) */
+
 
 /**
- * [_flushlbf(3)](http://man7.org/linux/man-pages/man3/_flushlbf.3.html) flushes all
+ * [_flushlbf(3)](https://man7.org/linux/man-pages/man3/_flushlbf.3.html) flushes all
  * line-buffered streams.
  *
  * Available since API level 23.
  */
+
+#if __BIONIC_AVAILABILITY_GUARD(23)
 void _flushlbf(void) __INTRODUCED_IN(23);
+#endif /* __BIONIC_AVAILABILITY_GUARD(23) */
+
 
 /**
  * `__fseterr` sets the
@@ -116,7 +154,11 @@ void _flushlbf(void) __INTRODUCED_IN(23);
  *
  * Available since API level 28.
  */
-void __fseterr(FILE* __fp) __INTRODUCED_IN(28);
+
+#if __BIONIC_AVAILABILITY_GUARD(28)
+void __fseterr(FILE* _Nonnull __fp) __INTRODUCED_IN(28);
+#endif /* __BIONIC_AVAILABILITY_GUARD(28) */
+
 
 /** __fsetlocking() constant to query locking type. */
 #define FSETLOCKING_QUERY 0
@@ -126,13 +168,17 @@ void __fseterr(FILE* __fp) __INTRODUCED_IN(28);
 #define FSETLOCKING_BYCALLER 2
 
 /**
- * [__fsetlocking(3)](http://man7.org/linux/man-pages/man3/__fsetlocking.3.html) sets the
+ * [__fsetlocking(3)](https://man7.org/linux/man-pages/man3/__fsetlocking.3.html) sets the
  * stream's locking mode to one of the `FSETLOCKING_` types.
  *
  * Returns the current locking style, `FSETLOCKING_INTERNAL` or `FSETLOCKING_BYCALLER`.
  *
  * Available since API level 23.
  */
-int __fsetlocking(FILE* __fp, int __type) __INTRODUCED_IN(23);
+
+#if __BIONIC_AVAILABILITY_GUARD(23)
+int __fsetlocking(FILE* _Nonnull __fp, int __type) __INTRODUCED_IN(23);
+#endif /* __BIONIC_AVAILABILITY_GUARD(23) */
+
 
 __END_DECLS

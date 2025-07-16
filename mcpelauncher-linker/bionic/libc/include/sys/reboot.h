@@ -50,11 +50,11 @@ __BEGIN_DECLS
 #define RB_POWER_OFF LINUX_REBOOT_CMD_POWER_OFF
 
 /**
- * [reboot(2)](http://man7.org/linux/man-pages/man2/reboot.2.html) reboots the device.
+ * [reboot(2)](https://man7.org/linux/man-pages/man2/reboot.2.html) reboots the device.
  *
  * Does not return on successful reboot, returns 0 if CAD was successfully enabled/disabled,
  * and returns -1 and sets `errno` on failure.
  */
-int reboot(int __cmd);
+int reboot(int __op);
 
 __END_DECLS

@@ -32,43 +32,21 @@
 #include <unistd.h>
 
 void* shmat(int id, const void* address, int flags) {
-#if defined(SYS_shmat)
   return reinterpret_cast<void*>(syscall(SYS_shmat, id, address, flags));
-#else
-  // See the kernel's ipc/syscall.c for the other side of this dance.
-  void* result = nullptr;
-  if (syscall(SYS_ipc, SHMAT, id, flags, &result, address, 0) == -1) {
-    return reinterpret_cast<void*>(-1);
-  }
-  return result;
-#endif
 }
 
 int shmctl(int id, int cmd, struct shmid_ds* buf) {
-#if !defined(__LP64__) || defined(__mips__)
+#if !defined(__LP64__)
   // Annoyingly, the kernel requires this for 32-bit but rejects it for 64-bit.
-  // Mips64 is an exception to this, it requires the flag.
   cmd |= IPC_64;
 #endif
-#if defined(SYS_shmctl)
   return syscall(SYS_shmctl, id, cmd, buf);
-#else
-  return syscall(SYS_ipc, SHMCTL, id, cmd, 0, buf, 0);
-#endif
 }
 
 int shmdt(const void* address) {
-#if defined(SYS_shmdt)
   return syscall(SYS_shmdt, address);
-#else
-  return syscall(SYS_ipc, SHMDT, 0, 0, 0, address, 0);
-#endif
 }
 
 int shmget(key_t key, size_t size, int flags) {
-#if defined(SYS_shmget)
   return syscall(SYS_shmget, key, size, flags);
-#else
-  return syscall(SYS_ipc, SHMGET, key, size, flags, 0, 0);
-#endif
 }

@@ -61,11 +61,11 @@ __BEGIN_DECLS
 #define KLOG_SIZE_BUFFER 10
 
 /**
- * [klogctl(2)](http://man7.org/linux/man-pages/man2/syslog.2.html) operates on the kernel log.
+ * [klogctl(3)](https://man7.org/linux/man-pages/man2/klogctl.3.html) operates on the kernel log.
  *
  * This system call is not available to applications.
  * Use syslog() or `<android/log.h>` instead.
  */
-int klogctl(int __type, char* __buf, int __buf_size);
+int klogctl(int __type, char* __BIONIC_COMPLICATED_NULLNESS __buf, int __buf_size);
 
 __END_DECLS

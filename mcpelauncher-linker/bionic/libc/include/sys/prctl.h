@@ -40,11 +40,11 @@
 __BEGIN_DECLS
 
 /**
- * [prctl(2)](http://man7.org/linux/man-pages/man2/prctl.2.html) performs a variety of
+ * [prctl(2)](https://man7.org/linux/man-pages/man2/prctl.2.html) performs a variety of
  * operations based on the `PR_` constant passed as the first argument.
  *
  * Returns -1 and sets `errno` on failure; success values vary by option.
  */
-int prctl(int __option, ...);
+int prctl(int __op, ...);
 
 __END_DECLS

@@ -39,25 +39,24 @@ extern "C" void __restore(void);
 extern "C" int __rt_sigaction(int, const struct __kernel_sigaction*, struct __kernel_sigaction*, size_t);
 
 int sigaction(int signal, const struct sigaction* bionic_new_action, struct sigaction* bionic_old_action) {
-  __kernel_sigaction kernel_new_action;
+  __kernel_sigaction kernel_new_action = {};
   if (bionic_new_action != nullptr) {
     kernel_new_action.sa_flags = bionic_new_action->sa_flags;
     kernel_new_action.sa_handler = bionic_new_action->sa_handler;
     // Don't filter signals here; if the caller asked for everything to be blocked, we should obey.
     kernel_new_action.sa_mask = bionic_new_action->sa_mask;
-#if defined(SA_RESTORER)
+#if defined(__x86_64__)
+    // riscv64 doesn't have sa_restorer. For arm64 and 32-bit x86, unwinding
+    // works best if you just let the kernel supply the default restorer
+    // from [vdso]. gdb doesn't care, but libgcc needs the nop that the
+    // kernel includes before the actual code. (We could add that ourselves,
+    // but why bother?)
+    // TODO: why do arm32 and x86-64 need this to unwind through signal handlers?
     kernel_new_action.sa_restorer = bionic_new_action->sa_restorer;
-#if defined(__aarch64__)
-    // arm64 has sa_restorer, but unwinding works best if you just let the
-    // kernel supply the default restorer from [vdso]. gdb doesn't care, but
-    // libgcc needs the nop that the kernel includes before the actual code.
-    // (We could add that ourselves, but why bother?)
-#else
     if (!(kernel_new_action.sa_flags & SA_RESTORER)) {
       kernel_new_action.sa_flags |= SA_RESTORER;
       kernel_new_action.sa_restorer = &__restore_rt;
     }
-#endif
 #endif
   }
 
@@ -85,12 +84,34 @@ __strong_alias(sigaction64, sigaction);
 
 extern "C" int __rt_sigaction(int, const struct sigaction64*, struct sigaction64*, size_t);
 
+// sigaction and sigaction64 get interposed in ART: ensure that we don't end up calling
+//     sigchain sigaction -> bionic sigaction -> sigchain sigaction64 -> bionic sigaction64
+// by extracting the implementation of sigaction64 to a static function.
+static int __sigaction64(int signal, const struct sigaction64* bionic_new,
+                         struct sigaction64* bionic_old) {
+  struct sigaction64 kernel_new = {};
+  if (bionic_new) {
+    kernel_new = *bionic_new;
+#if defined(__arm__)
+    // (See sa_restorer comment in sigaction() above.)
+    if (!(kernel_new.sa_flags & SA_RESTORER)) {
+      kernel_new.sa_flags |= SA_RESTORER;
+      kernel_new.sa_restorer = (kernel_new.sa_flags & SA_SIGINFO) ? &__restore_rt : &__restore;
+    }
+#endif
+    // Don't filter signals here; if the caller asked for everything to be blocked, we should obey.
+    kernel_new.sa_mask = kernel_new.sa_mask;
+  }
+
+  return __rt_sigaction(signal, bionic_new ? &kernel_new : nullptr, bionic_old,
+                        sizeof(kernel_new.sa_mask));
+}
+
 int sigaction(int signal, const struct sigaction* bionic_new, struct sigaction* bionic_old) {
   // The 32-bit ABI is broken. struct sigaction includes a too-small sigset_t,
   // so we have to translate to struct sigaction64 first.
-  struct sigaction64 kernel_new;
+  struct sigaction64 kernel_new = {};
   if (bionic_new) {
-    kernel_new = {};
     kernel_new.sa_flags = bionic_new->sa_flags;
     kernel_new.sa_handler = bionic_new->sa_handler;
 #if defined(SA_RESTORER)
@@ -101,7 +122,7 @@ int sigaction(int signal, const struct sigaction* bionic_new, struct sigaction* 
   }
 
   struct sigaction64 kernel_old;
-  int result = sigaction64(signal, bionic_new ? &kernel_new : nullptr, &kernel_old);
+  int result = __sigaction64(signal, bionic_new ? &kernel_new : nullptr, &kernel_old);
   if (bionic_old) {
     *bionic_old = {};
     bionic_old->sa_flags = kernel_old.sa_flags;
@@ -115,23 +136,7 @@ int sigaction(int signal, const struct sigaction* bionic_new, struct sigaction* 
 }
 
 int sigaction64(int signal, const struct sigaction64* bionic_new, struct sigaction64* bionic_old) {
-  struct sigaction64 kernel_new;
-  if (bionic_new) {
-    kernel_new = *bionic_new;
-#if defined(SA_RESTORER)
-    if (!(kernel_new.sa_flags & SA_RESTORER)) {
-      kernel_new.sa_flags |= SA_RESTORER;
-      kernel_new.sa_restorer = (kernel_new.sa_flags & SA_SIGINFO) ? &__restore_rt : &__restore;
-    }
-#endif
-    // Don't filter signals here; if the caller asked for everything to be blocked, we should obey.
-    kernel_new.sa_mask = kernel_new.sa_mask;
-  }
-
-  return __rt_sigaction(signal,
-                        bionic_new ? &kernel_new : nullptr,
-                        bionic_old,
-                        sizeof(kernel_new.sa_mask));
+  return __sigaction64(signal, bionic_new, bionic_old);
 }
 
 #endif

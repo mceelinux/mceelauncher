@@ -30,20 +30,46 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/close_range.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 #include <android/fdsan.h>
 
 #include "private/ScopedSignalBlocker.h"
-#include "private/SigSetConverter.h"
+
+static int set_cloexec(int i) {
+  int v = fcntl(i, F_GETFD);
+  if (v == -1) return -1;  // almost certainly: errno == EBADF
+  return fcntl(i, F_SETFD, v | FD_CLOEXEC);
+}
+
+// mark all open fds except stdin/out/err as close-on-exec
+static int cloexec_except_stdioe() {
+  // requires 5.11+ or ACK 5.10-T kernel, otherwise returns ENOSYS or EINVAL
+  if (!close_range(3, ~0U, CLOSE_RANGE_CLOEXEC)) return 0;
+
+  // unfortunately getrlimit can lie:
+  // - both soft and hard limits can be lowered to 0, with fds still open, so it can underestimate
+  // - in practice it usually is some really large value (like 32K or more)
+  //   even though only a handful of small fds are actually open (ie. < 500),
+  //   this results in poor performance when trying to act on all possibly open fds
+  struct rlimit m;
+  int max = getrlimit(RLIMIT_NOFILE, &m) ? 1000000 : m.rlim_max;
+  for (int i = 3; i < max; ++i) set_cloexec(i);
+  return 0;
+}
 
 enum Action {
   kOpen,
   kClose,
-  kDup2
+  kDup2,
+  kChdir,
+  kFchdir,
 };
 
 struct __posix_spawn_file_action {
@@ -68,8 +94,22 @@ struct __posix_spawn_file_action {
     } else if (what == kClose) {
       // Failure to close is ignored.
       close(fd);
+    } else if (what == kChdir) {
+      if (chdir(path) == -1) _exit(127);
+    } else if (what == kFchdir) {
+      if (fchdir(fd) == -1) _exit(127);
     } else {
-      if (dup2(fd, new_fd) == -1) _exit(127);
+      // It's a dup2.
+      if (fd == new_fd) {
+        // dup2(2) is a no-op if fd == new_fd, but POSIX suggests that we should
+        // manually remove the O_CLOEXEC flag in that case (because otherwise
+        // what use is the dup?).
+        // See https://www.austingroupbugs.net/view.php?id=411 for details.
+        int flags = fcntl(fd, F_GETFD, 0);
+        if (flags == -1 || fcntl(fd, F_SETFD, flags & ~FD_CLOEXEC) == -1) _exit(127);
+      } else {
+        if (dup2(fd, new_fd) == -1) _exit(127);
+      }
     }
   }
 };
@@ -90,8 +130,10 @@ struct __posix_spawnattr {
   pid_t pgroup;
   sched_param schedparam;
   int schedpolicy;
-  SigSetConverter sigmask;
-  SigSetConverter sigdefault;
+  union {
+    sigset_t sigset;
+    sigset64_t sigset64;
+  } sigmask, sigdefault;
 };
 
 static void ApplyAttrs(short flags, const posix_spawnattr_t* attr) {
@@ -131,6 +173,10 @@ static void ApplyAttrs(short flags, const posix_spawnattr_t* attr) {
   if ((flags & POSIX_SPAWN_SETSIGMASK) != 0) {
     if (sigprocmask64(SIG_SETMASK, &(*attr)->sigmask.sigset64, nullptr)) _exit(127);
   }
+
+  if ((flags & POSIX_SPAWN_CLOEXEC_DEFAULT) != 0) {
+    if (cloexec_except_stdioe()) _exit(127);
+  }
 }
 
 static int posix_spawn(pid_t* pid_ptr,
@@ -140,8 +186,8 @@ static int posix_spawn(pid_t* pid_ptr,
                        char* const argv[],
                        char* const env[],
                        int exec_fn(const char* path, char* const argv[], char* const env[])) {
-  // See http://man7.org/linux/man-pages/man3/posix_spawn.3.html
-  // and http://pubs.opengroup.org/onlinepubs/9699919799/functions/posix_spawn.html
+  // See https://man7.org/linux/man-pages/man3/posix_spawn.3.html
+  // and https://pubs.opengroup.org/onlinepubs/9799919799.2024edition/functions/posix_spawn.html
 
   ScopedSignalBlocker ssb;
 
@@ -189,7 +235,7 @@ int posix_spawnattr_destroy(posix_spawnattr_t* attr) {
 int posix_spawnattr_setflags(posix_spawnattr_t* attr, short flags) {
   if ((flags & ~(POSIX_SPAWN_RESETIDS | POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_SETSIGDEF |
                  POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSCHEDPARAM | POSIX_SPAWN_SETSCHEDULER |
-                 POSIX_SPAWN_USEVFORK | POSIX_SPAWN_SETSID)) != 0) {
+                 POSIX_SPAWN_USEVFORK | POSIX_SPAWN_SETSID | POSIX_SPAWN_CLOEXEC_DEFAULT)) != 0) {
     return EINVAL;
   }
   (*attr)->flags = flags;
@@ -301,7 +347,7 @@ static int posix_spawn_add_file_action(posix_spawn_file_actions_t* actions,
   if (action == nullptr) return errno;
 
   action->next = nullptr;
-  if (path != nullptr) {
+  if (what == kOpen || what == kChdir) {
     action->path = strdup(path);
     if (action->path == nullptr) {
       free(action);
@@ -340,4 +386,13 @@ int posix_spawn_file_actions_addclose(posix_spawn_file_actions_t* actions, int f
 int posix_spawn_file_actions_adddup2(posix_spawn_file_actions_t* actions, int fd, int new_fd) {
   if (fd < 0 || new_fd < 0) return EBADF;
   return posix_spawn_add_file_action(actions, kDup2, fd, new_fd, nullptr, 0, 0);
+}
+
+int posix_spawn_file_actions_addchdir_np(posix_spawn_file_actions_t* actions, const char* path) {
+  return posix_spawn_add_file_action(actions, kChdir, -1, -1, path, 0, 0);
+}
+
+int posix_spawn_file_actions_addfchdir_np(posix_spawn_file_actions_t* actions, int fd) {
+  if (fd < 0) return EBADF;
+  return posix_spawn_add_file_action(actions, kFchdir, fd, -1, nullptr, 0, 0);
 }

@@ -33,9 +33,11 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <string.h>
+#include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/ucontext.h>
 #include <sys/un.h>
 
 #include <async_safe/log.h>
@@ -62,12 +64,18 @@ __LIBC_HIDDEN__ void __libc_init_profiling_handlers() {
   action.sa_flags = SA_SIGINFO | SA_RESTART;
   action.sa_sigaction = HandleProfilingSignal;
   sigaction(BIONIC_SIGNAL_PROFILER, &action, nullptr);
+
+  // The perfetto_hprof ART plugin installs a signal handler to handle this signal. That plugin
+  // does not get loaded for a) non-apps, b) non-profilable apps on user. The default signal
+  // disposition is to crash. We do not want the target to crash if we accidentally target a
+  // non-app or non-profilable process.
+  signal(BIONIC_SIGNAL_ART_PROFILER, SIG_IGN);
 }
 
+static void HandleSigsysSeccompOverride(int, siginfo_t*, void*);
 static void HandleTracedPerfSignal();
 
 static void HandleProfilingSignal(int /*signal_number*/, siginfo_t* info, void* /*ucontext*/) {
-  // Avoid clobbering errno.
   ErrnoRestorer errno_restorer;
 
   if (info->si_code != SI_QUEUE) {
@@ -86,6 +94,21 @@ static void HandleProfilingSignal(int /*signal_number*/, siginfo_t* info, void* 
     return;
   }
 
+  // Temporarily override SIGSYS handling, in a best-effort attempt at not
+  // crashing if we happen to be running in a process with a seccomp filter that
+  // disallows some of the syscalls done by this signal handler. This protects
+  // against SECCOMP_RET_TRAP with a crashing SIGSYS handler (typical of android
+  // minijails). Won't help if the filter is using SECCOMP_RET_KILL_*.
+  // Note: the override is process-wide, but short-lived. The syscalls are still
+  // blocked, but the overridden handler recovers from SIGSYS, and fakes the
+  // syscall return value as ENOSYS.
+  struct sigaction sigsys_override = {};
+  sigsys_override.sa_sigaction = &HandleSigsysSeccompOverride;
+  sigsys_override.sa_flags = SA_SIGINFO;
+
+  struct sigaction old_act = {};
+  sigaction(SIGSYS, &sigsys_override, &old_act);
+
   if (signal_value == kHeapprofdSignalValue) {
     HandleHeapprofdSignal();
   } else if (signal_value == kTracedPerfSignalValue) {
@@ -94,6 +117,7 @@ static void HandleProfilingSignal(int /*signal_number*/, siginfo_t* info, void* 
     async_safe_format_log(ANDROID_LOG_ERROR, "libc", "unrecognized profiling signal si_value: %d",
                           signal_value);
   }
+  sigaction(SIGSYS, &old_act, nullptr);
 }
 
 // Open /proc/self/{maps,mem}, connect to traced_perf, send the fds over the
@@ -102,28 +126,37 @@ static void HandleProfilingSignal(int /*signal_number*/, siginfo_t* info, void* 
 static void HandleTracedPerfSignal() {
   ScopedFd sock_fd{ socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0 /*protocol*/) };
   if (sock_fd.get() == -1) {
-    async_safe_format_log(ANDROID_LOG_ERROR, "libc", "failed to create socket: %s", strerror(errno));
+    async_safe_format_log(ANDROID_LOG_ERROR, "libc", "failed to create socket: %m");
     return;
   }
 
   sockaddr_un saddr{ AF_UNIX, "/dev/socket/traced_perf" };
   size_t addrlen = sizeof(sockaddr_un);
   if (connect(sock_fd.get(), reinterpret_cast<const struct sockaddr*>(&saddr), addrlen) == -1) {
-    async_safe_format_log(ANDROID_LOG_ERROR, "libc", "failed to connect to traced_perf socket: %s",
-                          strerror(errno));
+    async_safe_format_log(ANDROID_LOG_ERROR, "libc", "failed to connect to traced_perf socket: %m");
     return;
   }
 
+  // If the process is undumpable, /proc/self/mem will be owned by root:root, and therefore
+  // inaccessible to the process itself (see man 5 proc). We temporarily mark the process as
+  // dumpable to allow for the open. Note: prctl is not async signal safe per posix, but bionic's
+  // implementation is. Error checking on prctls is omitted due to them being trivial.
+  int orig_dumpable = prctl(PR_GET_DUMPABLE, 0, 0, 0, 0);
+  if (!orig_dumpable) {
+    prctl(PR_SET_DUMPABLE, 1, 0, 0, 0);
+  }
   ScopedFd maps_fd{ open("/proc/self/maps", O_RDONLY | O_CLOEXEC) };
+  ScopedFd mem_fd{ open("/proc/self/mem", O_RDONLY | O_CLOEXEC) };
+  if (!orig_dumpable) {
+    prctl(PR_SET_DUMPABLE, orig_dumpable, 0, 0, 0);
+  }
+
   if (maps_fd.get() == -1) {
-    async_safe_format_log(ANDROID_LOG_ERROR, "libc", "failed to open /proc/self/maps: %s",
-                          strerror(errno));
+    async_safe_format_log(ANDROID_LOG_ERROR, "libc", "failed to open /proc/self/maps: %m");
     return;
   }
-  ScopedFd mem_fd{ open("/proc/self/mem", O_RDONLY | O_CLOEXEC) };
   if (mem_fd.get() == -1) {
-    async_safe_format_log(ANDROID_LOG_ERROR, "libc", "failed to open /proc/self/mem: %s",
-                          strerror(errno));
+    async_safe_format_log(ANDROID_LOG_ERROR, "libc", "failed to open /proc/self/mem: %m");
     return;
   }
 
@@ -147,6 +180,38 @@ static void HandleTracedPerfSignal() {
   memcpy(CMSG_DATA(cmsg), send_fds, num_fds * sizeof(int));
 
   if (sendmsg(sock_fd.get(), &msg_hdr, 0) == -1) {
-    async_safe_format_log(ANDROID_LOG_ERROR, "libc", "failed to sendmsg: %s", strerror(errno));
+    async_safe_format_log(ANDROID_LOG_ERROR, "libc", "failed to sendmsg: %m");
   }
+}
+
+static void HandleSigsysSeccompOverride(int /*signal_number*/, siginfo_t* info,
+                                        void* void_context) {
+  ErrnoRestorer errno_restorer;
+  if (info->si_code != SYS_SECCOMP) {
+    return;
+  }
+
+  async_safe_format_log(
+      ANDROID_LOG_WARN, "libc",
+      "Profiling setup: trapped seccomp SIGSYS for syscall %d. Returning ENOSYS to caller.",
+      info->si_syscall);
+
+  // The handler is responsible for setting the return value as if the system
+  // call happened (which is arch-specific). Use a plausible unsuccessful value.
+  auto ret = -ENOSYS;
+  ucontext_t* ctx = reinterpret_cast<ucontext_t*>(void_context);
+
+#if defined(__aarch64__)
+  ctx->uc_mcontext.regs[0] = ret;
+#elif defined(__arm__)
+  ctx->uc_mcontext.arm_r0 = ret;
+#elif defined(__i386__)
+  ctx->uc_mcontext.gregs[REG_EAX] = ret;
+#elif defined(__riscv)
+  ctx->uc_mcontext.__gregs[REG_A0] = ret;
+#elif defined(__x86_64__)
+  ctx->uc_mcontext.gregs[REG_RAX] = ret;
+#else
+#error "unsupported architecture"
+#endif
 }

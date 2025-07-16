@@ -31,25 +31,28 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdarg.h>
+#include <stdint.h>
+#include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/types.h>
-#include <sys/uio.h>
-#include <sys/vfs.h>
 #include <unistd.h>
 
+#include "platform/bionic/macros.h"
+#include "platform/bionic/page.h"
+#include "private/ErrnoRestorer.h"
 #include "private/bionic_fdtrack.h"
 
 #if defined(__LP64__)
 #error This code is only needed on 32-bit systems!
 #endif
 
-// System calls we need.
+// To implement lseek64() on ILP32, we need to use the _llseek() system call
+// which splits the off64_t into two 32-bit arguments and returns the off64_t
+// result via a pointer because 32-bit kernels can't accept 64-bit arguments
+// or return 64-bit results. (Our symbol is __llseek with two underscores for
+// historical reasons, but it's exposed as ABI so we can't fix it.)
 extern "C" int __llseek(int, unsigned long, unsigned long, off64_t*, int);
-extern "C" int __preadv64(int, const struct iovec*, int, long, long);
-extern "C" int __pwritev64(int, const struct iovec*, int, long, long);
 
-// For lseek64 we need to use the llseek system call which splits the off64_t in two and
-// returns the off64_t result via a pointer because 32-bit kernels can't return 64-bit results.
 off64_t lseek64(int fd, off64_t off, int whence) {
   off64_t result;
   unsigned long off_hi = static_cast<unsigned long>(off >> 32);
@@ -68,23 +71,6 @@ ssize_t pread(int fd, void* buf, size_t byte_count, off_t offset) {
 // There is no pwrite for 32-bit off_t, so we need to widen and call pwrite64.
 ssize_t pwrite(int fd, const void* buf, size_t byte_count, off_t offset) {
   return pwrite64(fd, buf, byte_count, static_cast<off64_t>(offset));
-}
-
-// On LP32, there is no off_t preadv/pwritev, and even the 64-bit preadv/pwritev
-// don't use off64_t (see SYSCALLS.TXT for more). Here, this means that we need
-// to implement all four functions because the two system calls don't match any
-// of the userspace functions. Unlike llseek, the pair is split lo-hi, not hi-lo.
-ssize_t preadv(int fd, const struct iovec* ios, int count, off_t offset) {
-  return preadv64(fd, ios, count, offset);
-}
-ssize_t preadv64(int fd, const struct iovec* ios, int count, off64_t offset) {
-  return __preadv64(fd, ios, count, offset, offset >> 32);
-}
-ssize_t pwritev(int fd, const struct iovec* ios, int count, off_t offset) {
-  return pwritev64(fd, ios, count, offset);
-}
-ssize_t pwritev64(int fd, const struct iovec* ios, int count, off64_t offset) {
-  return __pwritev64(fd, ios, count, offset, offset >> 32);
 }
 
 // There is no fallocate for 32-bit off_t, so we need to widen and call fallocate64.
@@ -119,4 +105,65 @@ int prlimit(pid_t pid, int resource, const rlimit* n32, rlimit* o32) {
     o32->rlim_max = (o64.rlim_max == RLIM64_INFINITY) ? RLIM_INFINITY : o64.rlim_max;
   }
   return result;
+}
+
+// mmap2(2) is like mmap(2), but the offset is in 4096-byte blocks (regardless
+// of page size), not bytes, to enable mapping parts of large files past the
+// 4GiB limit but without the inconvenience of dealing with 64-bit values, with
+// no down side since mappings need to be page aligned anyway, and the 32-bit
+// architectures that support this system call all have 4KiB pages.
+extern "C" void* __mmap2(void*, size_t, int, int, int, size_t);
+
+void* mmap64(void* addr, size_t size, int prot, int flags, int fd, off64_t offset) {
+  static constexpr size_t MMAP2_SHIFT = 12;
+
+  if (offset < 0 || (offset & ((1UL << MMAP2_SHIFT) - 1)) != 0) {
+    errno = EINVAL;
+    return MAP_FAILED;
+  }
+
+  // Prevent allocations large enough for `end - start` to overflow,
+  // to avoid security bugs.
+  size_t rounded = __BIONIC_ALIGN(size, page_size());
+  if (rounded < size || rounded > PTRDIFF_MAX) {
+    errno = ENOMEM;
+    return MAP_FAILED;
+  }
+
+  return __mmap2(addr, size, prot, flags, fd, offset >> MMAP2_SHIFT);
+}
+
+void* mmap(void* addr, size_t size, int prot, int flags, int fd, off_t offset) {
+  return mmap64(addr, size, prot, flags, fd, static_cast<off64_t>(offset));
+}
+
+// The only difference here is that the libc API uses varargs for the
+// optional `new_address` argument that's only used by MREMAP_FIXED.
+extern "C" void* __mremap(void*, size_t, size_t, int, void*);
+
+void* mremap(void* old_address, size_t old_size, size_t new_size, int flags, ...) {
+  // Prevent allocations large enough for `end - start` to overflow,
+  // to avoid security bugs.
+  size_t rounded = __BIONIC_ALIGN(new_size, page_size());
+  if (rounded < new_size || rounded > PTRDIFF_MAX) {
+    errno = ENOMEM;
+    return MAP_FAILED;
+  }
+
+  // The optional argument is only valid if the MREMAP_FIXED flag is set,
+  // so we assume it's not present otherwise.
+  void* new_address = nullptr;
+  if ((flags & MREMAP_FIXED) != 0) {
+    va_list ap;
+    va_start(ap, flags);
+    new_address = va_arg(ap, void*);
+    va_end(ap);
+  }
+  return __mremap(old_address, old_size, new_size, flags, new_address);
+}
+
+// mseal(2) is LP64-only.
+int mseal(void*, size_t, unsigned long) {
+  errno = ENOSYS;
+  return -1;
 }

@@ -58,6 +58,7 @@
 #include <android/dlext.h>
 
 #include <platform/bionic/malloc.h>
+#include <private/ScopedPthreadMutexLocker.h>
 #include <private/bionic_config.h>
 #include <private/bionic_defs.h>
 #include <private/bionic_malloc_dispatch.h>
@@ -66,6 +67,7 @@
 
 #include "gwp_asan_wrappers.h"
 #include "heap_tagging.h"
+#include "heap_zero_init.h"
 #include "malloc_common.h"
 #include "malloc_common_dynamic.h"
 #include "malloc_heapprofd.h"
@@ -78,7 +80,7 @@ pthread_mutex_t gGlobalsMutateLock = PTHREAD_MUTEX_INITIALIZER;
 
 _Atomic bool gGlobalsMutating = false;
 
-static bool gZygoteChild = false;
+bool gZygoteChild = false;
 
 // In a Zygote child process, this is set to true if profiling of this process
 // is allowed. Note that this is set at a later time than gZygoteChild. The
@@ -87,7 +89,7 @@ static bool gZygoteChild = false;
 // domains if applicable). These two flags are read by the
 // BIONIC_SIGNAL_PROFILER handler, which does nothing if the process is not
 // profileable.
-static _Atomic bool gZygoteChildProfileable = false;
+_Atomic bool gZygoteChildProfileable = false;
 
 // =============================================================================
 
@@ -277,17 +279,10 @@ bool InitSharedLibrary(void* impl_handle, const char* shared_lib, const char* pr
   return true;
 }
 
-// Note about USE_SCUDO. This file is compiled into libc.so and libc_scudo.so.
-// When compiled into libc_scudo.so, the libc_malloc_* libraries don't need
-// to be loaded from the runtime namespace since libc_scudo.so is not from
-// the runtime APEX, but is copied to any APEX that needs it.
-#ifndef USE_SCUDO
 extern "C" struct android_namespace_t* android_get_exported_namespace(const char* name);
-#endif
 
 void* LoadSharedLibrary(const char* shared_lib, const char* prefix, MallocDispatch* dispatch_table) {
   void* impl_handle = nullptr;
-#ifndef USE_SCUDO
   // Try to load the libc_malloc_* libs from the "runtime" namespace and then
   // fall back to dlopen() to load them from the default namespace.
   //
@@ -298,7 +293,7 @@ void* LoadSharedLibrary(const char* shared_lib, const char* prefix, MallocDispat
   // linker will load the libs found in /system/lib which might be incompatible
   // with libc.so in the runtime APEX. Use android_dlopen_ext to explicitly load
   // the ones in the runtime APEX.
-  struct android_namespace_t* runtime_ns = android_get_exported_namespace("com.android.runtime");
+  struct android_namespace_t* runtime_ns = android_get_exported_namespace("com_android_runtime");
   if (runtime_ns != nullptr) {
     const android_dlextinfo dlextinfo = {
       .flags = ANDROID_DLEXT_USE_NAMESPACE,
@@ -306,7 +301,6 @@ void* LoadSharedLibrary(const char* shared_lib, const char* prefix, MallocDispat
     };
     impl_handle = android_dlopen_ext(shared_lib, RTLD_NOW | RTLD_LOCAL, &dlextinfo);
   }
-#endif
 
   if (impl_handle == nullptr) {
     impl_handle = dlopen(shared_lib, RTLD_NOW | RTLD_LOCAL);
@@ -344,7 +338,7 @@ bool FinishInstallHooks(libc_globals* globals, const char* options, const char* 
   // Do a pointer swap so that all of the functions become valid at once to
   // avoid any initialization order problems.
   atomic_store(&globals->default_dispatch_table, &globals->malloc_dispatch_table);
-  if (GetDispatchTable() == nullptr) {
+  if (!MallocLimitInstalled()) {
     atomic_store(&globals->current_dispatch_table, &globals->malloc_dispatch_table);
   }
 
@@ -374,12 +368,26 @@ static bool InstallHooks(libc_globals* globals, const char* options, const char*
   return true;
 }
 
+extern "C" const char* __scudo_get_stack_depot_addr();
+extern "C" const char* __scudo_get_region_info_addr();
+extern "C" const char* __scudo_get_ring_buffer_addr();
+extern "C" size_t __scudo_get_ring_buffer_size();
+extern "C" size_t __scudo_get_stack_depot_size();
+
 // Initializes memory allocation framework once per process.
-static void MallocInitImpl(libc_globals* globals) {
+void MallocInitImpl(libc_globals* globals) {
   char prop[PROP_VALUE_MAX];
   char* options = prop;
 
-  MaybeInitGwpAsanFromLibc();
+  MaybeInitGwpAsanFromLibc(globals);
+
+#if defined(USE_SCUDO) && !__has_feature(hwaddress_sanitizer)
+  __libc_shared_globals()->scudo_stack_depot = __scudo_get_stack_depot_addr();
+  __libc_shared_globals()->scudo_region_info = __scudo_get_region_info_addr();
+  __libc_shared_globals()->scudo_ring_buffer = __scudo_get_ring_buffer_addr();
+  __libc_shared_globals()->scudo_ring_buffer_size = __scudo_get_ring_buffer_size();
+  __libc_shared_globals()->scudo_stack_depot_size = __scudo_get_stack_depot_size();
+#endif
 
   // Prefer malloc debug since it existed first and is a more complete
   // malloc interceptor than the hooks.
@@ -399,13 +407,6 @@ static void MallocInitImpl(libc_globals* globals) {
     // heapprofd signal handler invocations.
     HeapprofdRememberHookConflict();
   }
-}
-
-// Initializes memory allocation framework.
-// This routine is called from __libc_init routines in libc_init_dynamic.cpp.
-__BIONIC_WEAK_FOR_NATIVE_BRIDGE
-__LIBC_HIDDEN__ void __libc_init_malloc(libc_globals* globals) {
-  MallocInitImpl(globals);
 }
 
 // =============================================================================
@@ -460,79 +461,6 @@ extern "C" ssize_t malloc_backtrace(void* pointer, uintptr_t* frames, size_t fra
     return 0;
   }
   return reinterpret_cast<malloc_backtrace_func_t>(func)(pointer, frames, frame_count);
-}
-// =============================================================================
-
-// =============================================================================
-// Platform-internal mallopt variant.
-// =============================================================================
-__BIONIC_WEAK_FOR_NATIVE_BRIDGE
-extern "C" bool android_mallopt(int opcode, void* arg, size_t arg_size) {
-  if (opcode == M_SET_ZYGOTE_CHILD) {
-    if (arg != nullptr || arg_size != 0) {
-      errno = EINVAL;
-      return false;
-    }
-    gZygoteChild = true;
-    return true;
-  }
-  if (opcode == M_INIT_ZYGOTE_CHILD_PROFILING) {
-    if (arg != nullptr || arg_size != 0) {
-      errno = EINVAL;
-      return false;
-    }
-    atomic_store_explicit(&gZygoteChildProfileable, true, memory_order_release);
-    // Also check if heapprofd should start profiling from app startup.
-    HeapprofdInitZygoteChildProfiling();
-    return true;
-  }
-  if (opcode == M_GET_PROCESS_PROFILEABLE) {
-    if (arg == nullptr || arg_size != sizeof(bool)) {
-      errno = EINVAL;
-      return false;
-    }
-    // Native processes are considered profileable. Zygote children are considered
-    // profileable only when appropriately tagged.
-    *reinterpret_cast<bool*>(arg) =
-        !gZygoteChild || atomic_load_explicit(&gZygoteChildProfileable, memory_order_acquire);
-    return true;
-  }
-  if (opcode == M_SET_ALLOCATION_LIMIT_BYTES) {
-    return LimitEnable(arg, arg_size);
-  }
-  if (opcode == M_WRITE_MALLOC_LEAK_INFO_TO_FILE) {
-    if (arg == nullptr || arg_size != sizeof(FILE*)) {
-      errno = EINVAL;
-      return false;
-    }
-    return WriteMallocLeakInfo(reinterpret_cast<FILE*>(arg));
-  }
-  if (opcode == M_GET_MALLOC_LEAK_INFO) {
-    if (arg == nullptr || arg_size != sizeof(android_mallopt_leak_info_t)) {
-      errno = EINVAL;
-      return false;
-    }
-    return GetMallocLeakInfo(reinterpret_cast<android_mallopt_leak_info_t*>(arg));
-  }
-  if (opcode == M_FREE_MALLOC_LEAK_INFO) {
-    if (arg == nullptr || arg_size != sizeof(android_mallopt_leak_info_t)) {
-      errno = EINVAL;
-      return false;
-    }
-    return FreeMallocLeakInfo(reinterpret_cast<android_mallopt_leak_info_t*>(arg));
-  }
-  if (opcode == M_SET_HEAP_TAGGING_LEVEL) {
-    return SetHeapTaggingLevel(arg, arg_size);
-  }
-  if (opcode == M_INITIALIZE_GWP_ASAN) {
-    if (arg == nullptr || arg_size != sizeof(bool)) {
-      errno = EINVAL;
-      return false;
-    }
-    return MaybeInitGwpAsan(*reinterpret_cast<bool*>(arg));
-  }
-  // Try heapprofd's mallopt, as it handles options not covered here.
-  return HeapprofdMallopt(opcode, arg, arg_size);
 }
 // =============================================================================
 

@@ -16,8 +16,9 @@
 
 #include <dirent.h>
 
-#include <fcntl.h>
+#include <assert.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -32,10 +33,8 @@ class ScandirResult {
   }
 
   ~ScandirResult() {
-    while (size_ > 0) {
-      free(names_[--size_]);
-    }
-    free(names_);
+    // We always call release(), so this can't happen.
+    if (names_ != nullptr) __assert(__FILE__, __LINE__, "missing call to release()");
   }
 
   size_t size() {
@@ -70,11 +69,8 @@ class ScandirResult {
   }
 
   void Sort(int (*comparator)(const dirent**, const dirent**)) {
-    // If we have entries and a comparator, sort them.
-    if (size_ > 0 && comparator != nullptr) {
-      qsort(names_, size_, sizeof(dirent*),
-            reinterpret_cast<int (*)(const void*, const void*)>(comparator));
-    }
+    qsort(names_, size_, sizeof(dirent*),
+          reinterpret_cast<int (*)(const void*, const void*)>(comparator));
   }
 
  private:
@@ -121,7 +117,9 @@ int scandirat(int parent_fd, const char* dir_name, dirent*** name_list,
     names.Add(entry);
   }
 
-  names.Sort(comparator);
+  if (comparator != nullptr) {
+    names.Sort(comparator);
+  }
 
   size_t size = names.size();
   *name_list = names.release();

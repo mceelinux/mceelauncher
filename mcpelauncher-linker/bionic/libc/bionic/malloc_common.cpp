@@ -38,11 +38,14 @@
 #include <stdint.h>
 #include <stdio.h>
 
-#include <private/bionic_config.h>
 #include <platform/bionic/malloc.h>
+#include <private/ScopedPthreadMutexLocker.h>
+#include <private/bionic_config.h>
+#include <private/bionic_defs.h>
 
 #include "gwp_asan_wrappers.h"
 #include "heap_tagging.h"
+#include "heap_zero_init.h"
 #include "malloc_common.h"
 #include "malloc_limit.h"
 #include "malloc_tagged_pointers.h"
@@ -100,11 +103,35 @@ extern "C" int malloc_info(int options, FILE* fp) {
 }
 
 extern "C" int mallopt(int param, int value) {
+  // Some are handled by libc directly rather than by the allocator.
+  if (param == M_BIONIC_SET_HEAP_TAGGING_LEVEL) {
+    ScopedPthreadMutexLocker locker(&g_heap_tagging_lock);
+    return SetHeapTaggingLevel(static_cast<HeapTaggingLevel>(value));
+  }
+  if (param == M_BIONIC_ZERO_INIT) {
+    return SetHeapZeroInitialize(value);
+  }
+
+  // The rest we pass on...
+  int retval;
   auto dispatch_table = GetDispatchTable();
   if (__predict_false(dispatch_table != nullptr)) {
-    return dispatch_table->mallopt(param, value);
+    retval = dispatch_table->mallopt(param, value);
+  } else {
+    retval = Malloc(mallopt)(param, value);
   }
-  return Malloc(mallopt)(param, value);
+
+  // Track the M_DECAY_TIME mallopt calls.
+  if (param == M_DECAY_TIME && retval == 1) {
+    __libc_globals.mutate([value](libc_globals* globals) {
+      if (value <= 0) {
+        atomic_store(&globals->decay_time_enabled, false);
+      } else {
+        atomic_store(&globals->decay_time_enabled, true);
+      }
+    });
+  }
+  return retval;
 }
 
 extern "C" void* malloc(size_t bytes) {
@@ -306,30 +333,6 @@ extern "C" int __sanitizer_malloc_info(int, FILE*) {
 #endif
 // =============================================================================
 
-// =============================================================================
-// Platform-internal mallopt variant.
-// =============================================================================
-#if defined(LIBC_STATIC)
-extern "C" bool android_mallopt(int opcode, void* arg, size_t arg_size) {
-  if (opcode == M_SET_ALLOCATION_LIMIT_BYTES) {
-    return LimitEnable(arg, arg_size);
-  }
-  if (opcode == M_SET_HEAP_TAGGING_LEVEL) {
-    return SetHeapTaggingLevel(arg, arg_size);
-  }
-  if (opcode == M_INITIALIZE_GWP_ASAN) {
-    if (arg == nullptr || arg_size != sizeof(bool)) {
-      errno = EINVAL;
-      return false;
-    }
-    return MaybeInitGwpAsan(*reinterpret_cast<bool*>(arg));
-  }
-  errno = ENOTSUP;
-  return false;
-}
-#endif
-// =============================================================================
-
 static constexpr MallocDispatch __libc_malloc_default_dispatch __attribute__((unused)) = {
   Malloc(calloc),
   Malloc(free),
@@ -355,4 +358,38 @@ static constexpr MallocDispatch __libc_malloc_default_dispatch __attribute__((un
 
 const MallocDispatch* NativeAllocatorDispatch() {
   return &__libc_malloc_default_dispatch;
+}
+
+#if !defined(LIBC_STATIC)
+void MallocInitImpl(libc_globals* globals);
+#endif
+
+// Initializes memory allocation framework.
+// This routine is called from __libc_init routines in libc_init_dynamic.cpp
+// and libc_init_static.cpp.
+__BIONIC_WEAK_FOR_NATIVE_BRIDGE
+__LIBC_HIDDEN__ void __libc_init_malloc(libc_globals* globals) {
+#if !defined(LIBC_STATIC)
+  MallocInitImpl(globals);
+#endif
+  const char* value = getenv("MALLOC_USE_APP_DEFAULTS");
+  if (value == nullptr || value[0] == '\0') {
+    return;
+  }
+
+  // Normal apps currently turn off zero init for performance reasons.
+  SetHeapZeroInitialize(false);
+
+  // Do not call mallopt directly since that will try and lock the globals
+  // data structure.
+  int retval;
+  auto dispatch_table = GetDispatchTable();
+  if (__predict_false(dispatch_table != nullptr)) {
+    retval = dispatch_table->mallopt(M_DECAY_TIME, 1);
+  } else {
+    retval = Malloc(mallopt)(M_DECAY_TIME, 1);
+  }
+  if (retval == 1) {
+    globals->decay_time_enabled = true;
+  }
 }

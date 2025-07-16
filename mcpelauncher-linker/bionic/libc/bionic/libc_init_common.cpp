@@ -27,11 +27,12 @@
  */
 
 #include "libc_init_common.h"
-#include "heap_tagging.h"
 
+#include <async_safe/log.h>
 #include <elf.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -42,8 +43,8 @@
 #include <sys/time.h>
 #include <unistd.h>
 
-#include <async_safe/log.h>
-
+#include "heap_tagging.h"
+#include "private/ScopedPthreadMutexLocker.h"
 #include "private/WriteProtected.h"
 #include "private/bionic_defs.h"
 #include "private/bionic_globals.h"
@@ -52,11 +53,38 @@
 #include "pthread_internal.h"
 
 extern "C" int __system_properties_init(void);
+extern "C" void scudo_malloc_set_zero_contents(int);
+extern "C" void scudo_malloc_set_pattern_fill_contents(int);
 
-__LIBC_HIDDEN__ WriteProtected<libc_globals> __libc_globals;
+__LIBC_HIDDEN__ constinit WriteProtected<libc_globals> __libc_globals;
+__LIBC_HIDDEN__ constinit _Atomic(bool) __libc_memtag_stack;
+__LIBC_HIDDEN__ constinit bool __libc_memtag_stack_abi;
 
 // Not public, but well-known in the BSDs.
+__BIONIC_WEAK_VARIABLE_FOR_NATIVE_BRIDGE
 const char* __progname;
+
+#if defined(__i386__) || defined(__x86_64__)
+// Default sizes based on the old hard-coded values for Atom/Silvermont (x86) and Core 2 (x86-64)...
+size_t __x86_data_cache_size = 24 * 1024;
+size_t __x86_data_cache_size_half = __x86_data_cache_size / 2;
+size_t __x86_shared_cache_size = sizeof(long) == 8 ? 4096 * 1024 : 1024 * 1024;
+size_t __x86_shared_cache_size_half = __x86_shared_cache_size / 2;
+// ...overwritten at runtime based on the cpu's reported cache sizes.
+static void __libc_init_x86_cache_info() {
+  // Handle the case where during early boot /sys fs may not yet be ready,
+  // resulting in sysconf() returning 0, leading to crashes.
+  // In that case (basically just init), we keep the defaults.
+  if (sysconf(_SC_LEVEL1_DCACHE_SIZE) != 0) {
+    __x86_data_cache_size = sysconf(_SC_LEVEL1_DCACHE_SIZE);
+    __x86_data_cache_size_half = __x86_data_cache_size / 2;
+  }
+  if (sysconf(_SC_LEVEL2_CACHE_SIZE) != 0) {
+    __x86_shared_cache_size = sysconf(_SC_LEVEL2_CACHE_SIZE);
+    __x86_shared_cache_size_half = __x86_shared_cache_size / 2;
+  }
+}
+#endif
 
 void __libc_init_globals() {
   // Initialize libc globals that are needed in both the linker and in libc.
@@ -72,8 +100,10 @@ void __libc_init_globals() {
 #if !defined(__LP64__)
 static void __check_max_thread_id() {
   if (gettid() > 65535) {
-    async_safe_fatal("Limited by the size of pthread_mutex_t, 32 bit bionic libc only accepts "
-                     "pid <= 65535, but current pid is %d", gettid());
+    async_safe_fatal("32-bit pthread_mutex_t only supports pids <= 65535; "
+                     "current pid %d; "
+                     "`echo 65535 > /proc/sys/kernel/pid_max` as root",
+                     gettid());
   }
 }
 #endif
@@ -81,6 +111,68 @@ static void __check_max_thread_id() {
 static void arc4random_fork_handler() {
   _rs_forked = 1;
   _thread_arc4_lock();
+}
+
+__BIONIC_WEAK_FOR_NATIVE_BRIDGE
+void __libc_init_scudo() {
+  // Heap tagging level *must* be set before interacting with Scudo, otherwise
+  // the primary will be mapped with PROT_MTE even if MTE is is not enabled in
+  // this process.
+  SetDefaultHeapTaggingLevel();
+
+// TODO(b/158870657) make this unconditional when all devices support SCUDO.
+#if defined(USE_SCUDO) && !__has_feature(hwaddress_sanitizer)
+#if defined(SCUDO_PATTERN_FILL_CONTENTS)
+  scudo_malloc_set_pattern_fill_contents(1);
+#elif defined(SCUDO_ZERO_CONTENTS)
+  scudo_malloc_set_zero_contents(1);
+#endif
+#endif
+}
+
+__BIONIC_WEAK_FOR_NATIVE_BRIDGE
+__attribute__((no_sanitize("hwaddress", "memtag"))) void
+__libc_init_mte_late() {
+#if defined(__aarch64__)
+  if (!__libc_shared_globals()->heap_tagging_upgrade_timer_sec) {
+    return;
+  }
+  struct sigevent event = {};
+  static timer_t timer;
+  event.sigev_notify = SIGEV_THREAD;
+  event.sigev_notify_function = [](union sigval) {
+    async_safe_format_log(ANDROID_LOG_INFO, "libc",
+                          "Downgrading MTE to async.");
+    ScopedPthreadMutexLocker l(&g_heap_tagging_lock);
+    SetHeapTaggingLevel(M_HEAP_TAGGING_LEVEL_ASYNC);
+    timer_delete(timer);
+  };
+
+  if (timer_create(CLOCK_REALTIME, &event, &timer) == -1) {
+    async_safe_format_log(ANDROID_LOG_ERROR, "libc",
+                          "Failed to create MTE downgrade timer: %m");
+    // Revert back to ASYNC. If we fail to create or arm the timer, otherwise
+    // the process would be indefinitely stuck in SYNC.
+    SetHeapTaggingLevel(M_HEAP_TAGGING_LEVEL_ASYNC);
+    return;
+  }
+
+  struct itimerspec timerspec = {};
+  timerspec.it_value.tv_sec =
+      __libc_shared_globals()->heap_tagging_upgrade_timer_sec;
+  if (timer_settime(timer, /* flags= */ 0, &timerspec, nullptr) == -1) {
+    async_safe_format_log(ANDROID_LOG_ERROR, "libc",
+                          "Failed to arm MTE downgrade timer: %m");
+    // Revert back to ASYNC. If we fail to create or arm the timer, otherwise
+    // the process would be indefinitely stuck in SYNC.
+    SetHeapTaggingLevel(M_HEAP_TAGGING_LEVEL_ASYNC);
+    timer_delete(timer);
+    return;
+  }
+  async_safe_format_log(
+      ANDROID_LOG_INFO, "libc", "Armed MTE downgrade timer for %" PRId64 " s",
+      __libc_shared_globals()->heap_tagging_upgrade_timer_sec);
+#endif
 }
 
 __BIONIC_WEAK_FOR_NATIVE_BRIDGE
@@ -106,7 +198,9 @@ void __libc_init_common() {
   __libc_init_fdsan(); // Requires system properties (for debug.fdsan).
   __libc_init_fdtrack();
 
-  SetDefaultHeapTaggingLevel();
+#if defined(__i386__) || defined(__x86_64__)
+  __libc_init_x86_cache_info();
+#endif
 }
 
 void __libc_init_fork_handler() {
@@ -114,7 +208,15 @@ void __libc_init_fork_handler() {
   pthread_atfork(arc4random_fork_handler, _thread_arc4_unlock, _thread_arc4_unlock);
 }
 
-__noreturn static void __early_abort(int line) {
+extern "C" void scudo_malloc_set_add_large_allocation_slack(int add_slack);
+
+__BIONIC_WEAK_FOR_NATIVE_BRIDGE void __libc_set_target_sdk_version(int target_api_level __unused) {
+#if defined(USE_SCUDO) && !__has_feature(hwaddress_sanitizer)
+  scudo_malloc_set_add_large_allocation_slack(target_api_level < 31);
+#endif
+}
+
+__noreturn static void __early_abort(size_t line) {
   // We can't write to stdout or stderr because we're aborting before we've checked that
   // it's safe for us to use those file descriptors. We probably can't strace either, so
   // we rely on the fact that if we dereference a low address, either debuggerd or the
@@ -123,50 +225,25 @@ __noreturn static void __early_abort(int line) {
   _exit(EXIT_FAILURE);
 }
 
-// Force any of the closed stdin, stdout and stderr to be associated with /dev/null.
+// Force any of the stdin/stdout/stderr file descriptors that aren't
+// open to be associated with /dev/null.
 static void __nullify_closed_stdio() {
-  int dev_null = TEMP_FAILURE_RETRY(open("/dev/null", O_RDWR));
-  if (dev_null == -1) {
-    // init won't have /dev/null available, but SELinux provides an equivalent.
-    dev_null = TEMP_FAILURE_RETRY(open("/sys/fs/selinux/null", O_RDWR));
-  }
-  if (dev_null == -1) {
-    __early_abort(__LINE__);
-  }
-
-  // If any of the stdio file descriptors is valid and not associated
-  // with /dev/null, dup /dev/null to it.
   for (int i = 0; i < 3; i++) {
-    // If it is /dev/null already, we are done.
-    if (i == dev_null) {
-      continue;
-    }
+    if (TEMP_FAILURE_RETRY(fcntl(i, F_GETFL)) == -1) {
+      // The only error we allow is that the file descriptor does not exist.
+      if (errno != EBADF) __early_abort(__LINE__);
 
-    // Is this fd already open?
-    int status = TEMP_FAILURE_RETRY(fcntl(i, F_GETFL));
-    if (status != -1) {
-      continue;
-    }
-
-    // The only error we allow is that the file descriptor does not
-    // exist, in which case we dup /dev/null to it.
-    if (errno == EBADF) {
-      // Try dupping /dev/null to this stdio file descriptor and
-      // repeat if there is a signal. Note that any errors in closing
-      // the stdio descriptor are lost.
-      status = TEMP_FAILURE_RETRY(dup2(dev_null, i));
-      if (status == -1) {
+      // This file descriptor wasn't open, so open /dev/null.
+      // init won't have /dev/null available, but SELinux provides an equivalent.
+      // This takes advantage of the fact that open() will take the lowest free
+      // file descriptor, and we're iterating in order from 0, but we'll
+      // double-check we got the right fd anyway...
+      int fd;
+      if (((fd = TEMP_FAILURE_RETRY(open("/dev/null", O_RDWR))) == -1 &&
+           (fd = TEMP_FAILURE_RETRY(open("/sys/fs/selinux/null", O_RDWR))) == -1) ||
+          fd != i) {
         __early_abort(__LINE__);
       }
-    } else {
-      __early_abort(__LINE__);
-    }
-  }
-
-  // If /dev/null is not one of the stdio file descriptors, close it.
-  if (dev_null > 2) {
-    if (close(dev_null) == -1) {
-      __early_abort(__LINE__);
     }
   }
 }
@@ -230,37 +307,39 @@ static bool __is_unsafe_environment_variable(const char* name) {
   // of executing a setuid program or the result of an SELinux
   // security transition.
   static constexpr const char* UNSAFE_VARIABLE_NAMES[] = {
-    "ANDROID_DNS_MODE",
-    "GCONV_PATH",
-    "GETCONF_DIR",
-    "HOSTALIASES",
-    "JE_MALLOC_CONF",
-    "LD_AOUT_LIBRARY_PATH",
-    "LD_AOUT_PRELOAD",
-    "LD_AUDIT",
-    "LD_CONFIG_FILE",
-    "LD_DEBUG",
-    "LD_DEBUG_OUTPUT",
-    "LD_DYNAMIC_WEAK",
-    "LD_LIBRARY_PATH",
-    "LD_ORIGIN_PATH",
-    "LD_PRELOAD",
-    "LD_PROFILE",
-    "LD_SHOW_AUXV",
-    "LD_USE_LOAD_BIAS",
-    "LIBC_DEBUG_MALLOC_OPTIONS",
-    "LIBC_HOOKS_ENABLE",
-    "LOCALDOMAIN",
-    "LOCPATH",
-    "MALLOC_CHECK_",
-    "MALLOC_CONF",
-    "MALLOC_TRACE",
-    "NIS_PATH",
-    "NLSPATH",
-    "RESOLV_HOST_CONF",
-    "RES_OPTIONS",
-    "TMPDIR",
-    "TZDIR",
+      "ANDROID_DNS_MODE",
+      "GCONV_PATH",
+      "GETCONF_DIR",
+      "HOSTALIASES",
+      "JE_MALLOC_CONF",
+      "LD_AOUT_LIBRARY_PATH",
+      "LD_AOUT_PRELOAD",
+      "LD_AUDIT",
+      "LD_CONFIG_FILE",
+      "LD_DEBUG",
+      "LD_DEBUG_OUTPUT",
+      "LD_DYNAMIC_WEAK",
+      "LD_HWASAN",
+      "LD_LIBRARY_PATH",
+      "LD_ORIGIN_PATH",
+      "LD_PRELOAD",
+      "LD_PROFILE",
+      "LD_SHOW_AUXV",
+      "LD_USE_LOAD_BIAS",
+      "LIBC_DEBUG_MALLOC_OPTIONS",
+      "LIBC_HOOKS_ENABLE",
+      "LOCALDOMAIN",
+      "LOCPATH",
+      "MALLOC_CHECK_",
+      "MALLOC_CONF",
+      "MALLOC_TRACE",
+      "NIS_PATH",
+      "NLSPATH",
+      "RESOLV_HOST_CONF",
+      "RES_OPTIONS",
+      "SCUDO_OPTIONS",
+      "TMPDIR",
+      "TZDIR",
   };
   for (const auto& unsafe_variable_name : UNSAFE_VARIABLE_NAMES) {
     if (env_match(name, unsafe_variable_name) != nullptr) {
@@ -291,11 +370,11 @@ static void __initialize_personality() {
 #if !defined(__LP64__)
   int old_value = personality(0xffffffff);
   if (old_value == -1) {
-    async_safe_fatal("error getting old personality value: %s", strerror(errno));
+    async_safe_fatal("error getting old personality value: %m");
   }
 
   if (personality((static_cast<unsigned int>(old_value) & ~PER_MASK) | PER_LINUX32) == -1) {
-    async_safe_fatal("error setting PER_LINUX32 personality: %s", strerror(errno));
+    async_safe_fatal("error setting PER_LINUX32 personality: %m");
   }
 #endif
 }
@@ -347,10 +426,8 @@ void __libc_fini(void* array) {
   Dtor* fini_array = reinterpret_cast<Dtor*>(array);
   const Dtor minus1 = reinterpret_cast<Dtor>(static_cast<uintptr_t>(-1));
 
-  // Sanity check - first entry must be -1.
-  if (array == nullptr || fini_array[0] != minus1) {
-    return;
-  }
+  // Validity check: the first entry must be -1.
+  if (array == nullptr || fini_array[0] != minus1) return;
 
   // Skip over it.
   fini_array += 1;
@@ -361,15 +438,9 @@ void __libc_fini(void* array) {
     ++count;
   }
 
-  // Now call each destructor in reverse order.
+  // Now call each destructor in reverse order, ignoring any -1s.
   while (count > 0) {
     Dtor dtor = fini_array[--count];
-
-    // Sanity check, any -1 in the list is ignored.
-    if (dtor == minus1) {
-      continue;
-    }
-
-    dtor();
+    if (dtor != minus1) dtor();
   }
 }

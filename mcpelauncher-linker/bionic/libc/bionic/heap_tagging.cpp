@@ -30,62 +30,215 @@
 #include "malloc_common.h"
 #include "malloc_tagged_pointers.h"
 
+#include <bionic/pthread_internal.h>
 #include <platform/bionic/malloc.h>
-#include <platform/bionic/mte_kernel.h>
+#include <sanitizer/hwasan_interface.h>
+#include <sys/auxv.h>
+#include <sys/prctl.h>
 
+extern "C" void scudo_malloc_disable_memory_tagging();
+extern "C" void scudo_malloc_set_track_allocation_stacks(int);
+
+extern "C" const char* __scudo_get_stack_depot_addr();
+extern "C" const char* __scudo_get_ring_buffer_addr();
+extern "C" size_t __scudo_get_ring_buffer_size();
+extern "C" size_t __scudo_get_stack_depot_size();
+
+// Protected by `g_heap_tagging_lock`.
 static HeapTaggingLevel heap_tagging_level = M_HEAP_TAGGING_LEVEL_NONE;
 
 void SetDefaultHeapTaggingLevel() {
-  // Allow the kernel to accept tagged pointers in syscall arguments. This is a no-op (kernel
-  // returns -EINVAL) if the kernel doesn't understand the prctl.
 #if defined(__aarch64__)
-#define PR_SET_TAGGED_ADDR_CTRL 55
-#define PR_TAGGED_ADDR_ENABLE (1UL << 0)
-#ifdef ANDROID_EXPERIMENTAL_MTE
-  // First, try enabling MTE in asynchronous mode, with tag 0 excluded. This will fail if the kernel
-  // or hardware doesn't support MTE, and we will fall back to just enabling tagged pointers in
-  // syscall arguments.
-  if (prctl(PR_SET_TAGGED_ADDR_CTRL,
-            PR_TAGGED_ADDR_ENABLE | PR_MTE_TCF_ASYNC | (1 << PR_MTE_EXCL_SHIFT), 0, 0, 0) == 0) {
-    return;
-  }
-#endif // ANDROID_EXPERIMENTAL_MTE
+#if !__has_feature(hwaddress_sanitizer)
+  heap_tagging_level = __libc_shared_globals()->initial_heap_tagging_level;
+#endif
 
-  if (prctl(PR_SET_TAGGED_ADDR_CTRL, PR_TAGGED_ADDR_ENABLE, 0, 0, 0) == 0) {
-    heap_tagging_level = M_HEAP_TAGGING_LEVEL_TBI;
-    __libc_globals.mutate([](libc_globals* globals) {
-      globals->heap_pointer_tag = reinterpret_cast<uintptr_t>(POINTER_TAG) << TAG_SHIFT;
-    });
+  __libc_memtag_stack_abi = __libc_shared_globals()->initial_memtag_stack_abi;
+
+  __libc_globals.mutate([](libc_globals* globals) {
+    switch (heap_tagging_level) {
+      case M_HEAP_TAGGING_LEVEL_TBI:
+        // Arrange for us to set pointer tags to POINTER_TAG, check tags on
+        // deallocation and untag when passing pointers to the allocator.
+        globals->heap_pointer_tag = (reinterpret_cast<uintptr_t>(POINTER_TAG) << TAG_SHIFT) |
+                                    (0xffull << CHECK_SHIFT) | (0xffull << UNTAG_SHIFT);
+        break;
+      case M_HEAP_TAGGING_LEVEL_SYNC:
+      case M_HEAP_TAGGING_LEVEL_ASYNC:
+        atomic_store(&globals->memtag, true);
+        atomic_store(&__libc_memtag_stack, __libc_shared_globals()->initial_memtag_stack);
+        break;
+      default:
+        break;
+    };
+  });
+
+#if defined(USE_SCUDO) && !__has_feature(hwaddress_sanitizer)
+  switch (heap_tagging_level) {
+    case M_HEAP_TAGGING_LEVEL_TBI:
+    case M_HEAP_TAGGING_LEVEL_NONE:
+      scudo_malloc_disable_memory_tagging();
+      break;
+    case M_HEAP_TAGGING_LEVEL_SYNC:
+      scudo_malloc_set_track_allocation_stacks(1);
+      break;
+    default:
+      break;
   }
+#endif  // USE_SCUDO
 #endif  // aarch64
 }
 
-bool SetHeapTaggingLevel(void* arg, size_t arg_size) {
-  if (arg_size != sizeof(HeapTaggingLevel)) {
-    return false;
+static bool set_tcf_on_all_threads(int tcf) {
+  return android_run_on_all_threads(
+      [](void* arg) {
+        int tcf = *reinterpret_cast<int*>(arg);
+        int tagged_addr_ctrl = prctl(PR_GET_TAGGED_ADDR_CTRL, 0, 0, 0, 0);
+        if (tagged_addr_ctrl < 0) {
+          return false;
+        }
+
+        tagged_addr_ctrl = (tagged_addr_ctrl & ~PR_MTE_TCF_MASK) | tcf;
+        return prctl(PR_SET_TAGGED_ADDR_CTRL, tagged_addr_ctrl, 0, 0, 0) >= 0;
+      },
+      &tcf);
+}
+
+pthread_mutex_t g_heap_tagging_lock = PTHREAD_MUTEX_INITIALIZER;
+
+// Requires `g_heap_tagging_lock` to be held.
+bool SetHeapTaggingLevel(HeapTaggingLevel tag_level) {
+  if (tag_level == heap_tagging_level) {
+    return true;
   }
 
-  auto tag_level = *reinterpret_cast<HeapTaggingLevel*>(arg);
   switch (tag_level) {
     case M_HEAP_TAGGING_LEVEL_NONE:
+      __libc_globals.mutate([](libc_globals* globals) {
+        if (heap_tagging_level == M_HEAP_TAGGING_LEVEL_TBI) {
+          // Preserve the untag mask (we still want to untag pointers when passing them to the
+          // allocator), but clear the fixed tag and the check mask, so that pointers are no longer
+          // tagged and checks no longer happen.
+          globals->heap_pointer_tag = static_cast<uintptr_t>(0xffull << UNTAG_SHIFT);
+        }
+        atomic_store(&__libc_memtag_stack, false);
+        atomic_store(&globals->memtag, false);
+        atomic_store(&__libc_shared_globals()->memtag_currently_on, false);
+      });
+
+      if (heap_tagging_level != M_HEAP_TAGGING_LEVEL_TBI) {
+        if (!set_tcf_on_all_threads(PR_MTE_TCF_NONE)) {
+          error_log("SetHeapTaggingLevel: set_tcf_on_all_threads failed");
+          return false;
+        }
+      }
+#if defined(USE_SCUDO) && !__has_feature(hwaddress_sanitizer)
+      scudo_malloc_disable_memory_tagging();
+#endif
       break;
     case M_HEAP_TAGGING_LEVEL_TBI:
+    case M_HEAP_TAGGING_LEVEL_ASYNC:
+    case M_HEAP_TAGGING_LEVEL_SYNC:
       if (heap_tagging_level == M_HEAP_TAGGING_LEVEL_NONE) {
+#if !__has_feature(hwaddress_sanitizer)
+        // Suppress the error message in HWASan builds. Apps can try to enable TBI (or even MTE
+        // modes) being unaware of HWASan, fail them silently.
         error_log(
             "SetHeapTaggingLevel: re-enabling tagging after it was disabled is not supported");
+#endif
         return false;
+      } else if (tag_level == M_HEAP_TAGGING_LEVEL_TBI ||
+                 heap_tagging_level == M_HEAP_TAGGING_LEVEL_TBI) {
+        error_log("SetHeapTaggingLevel: switching between TBI and ASYNC/SYNC is not supported");
+        return false;
+      }
+
+      if (tag_level == M_HEAP_TAGGING_LEVEL_ASYNC) {
+        // When entering ASYNC mode, specify that we want to allow upgrading to SYNC by OR'ing in
+        // the SYNC flag. But if the kernel doesn't support specifying multiple TCF modes, fall back
+        // to specifying a single mode.
+        if (!set_tcf_on_all_threads(PR_MTE_TCF_ASYNC | PR_MTE_TCF_SYNC)) {
+          set_tcf_on_all_threads(PR_MTE_TCF_ASYNC);
+        }
+#if defined(USE_SCUDO) && !__has_feature(hwaddress_sanitizer)
+        scudo_malloc_set_track_allocation_stacks(0);
+#endif
+      } else if (tag_level == M_HEAP_TAGGING_LEVEL_SYNC) {
+        set_tcf_on_all_threads(PR_MTE_TCF_SYNC);
+#if defined(USE_SCUDO) && !__has_feature(hwaddress_sanitizer)
+        scudo_malloc_set_track_allocation_stacks(1);
+        __libc_shared_globals()->scudo_ring_buffer = __scudo_get_ring_buffer_addr();
+        __libc_shared_globals()->scudo_ring_buffer_size = __scudo_get_ring_buffer_size();
+        __libc_shared_globals()->scudo_stack_depot = __scudo_get_stack_depot_addr();
+        __libc_shared_globals()->scudo_stack_depot_size = __scudo_get_stack_depot_size();
+#endif
       }
       break;
     default:
       error_log("SetHeapTaggingLevel: unknown tagging level");
       return false;
   }
+
   heap_tagging_level = tag_level;
   info_log("SetHeapTaggingLevel: tag level set to %d", tag_level);
 
-  if (heap_tagging_level == M_HEAP_TAGGING_LEVEL_NONE && __libc_globals->heap_pointer_tag != 0) {
-    __libc_globals.mutate([](libc_globals* globals) { globals->heap_pointer_tag = 0; });
-  }
-
   return true;
+}
+
+#ifdef __aarch64__
+static inline __attribute__((no_sanitize("memtag"))) void untag_memory(void* from, void* to) {
+  if (from == to) {
+    return;
+  }
+  __asm__ __volatile__(
+      ".arch_extension mte\n"
+      "1:\n"
+      "stg %[Ptr], [%[Ptr]], #16\n"
+      "cmp %[Ptr], %[End]\n"
+      "b.lt 1b\n"
+      : [Ptr] "+&r"(from)
+      : [End] "r"(to)
+      : "memory");
+}
+#endif
+
+#ifdef __aarch64__
+// 128Mb of stack should be enough for anybody.
+static constexpr size_t kUntagLimit = 128 * 1024 * 1024;
+#endif  // __aarch64__
+
+extern "C" __LIBC_HIDDEN__ __attribute__((no_sanitize("memtag"))) void memtag_handle_longjmp(
+    void* sp_dst __unused, void* sp_src __unused) {
+  // A usual longjmp looks like this, where sp_dst was the LR in the call to setlongjmp (i.e.
+  // the SP of the frame calling setlongjmp).
+  // ┌─────────────────────┐                  │
+  // │                     │                  │
+  // ├─────────────────────┤◄──────── sp_dst  │ stack
+  // │         ...         │                  │ grows
+  // ├─────────────────────┤                  │ to lower
+  // │         ...         │                  │ addresses
+  // ├─────────────────────┤◄──────── sp_src  │
+  // │siglongjmp           │                  │
+  // ├─────────────────────┤                  │
+  // │memtag_handle_longjmp│                  │
+  // └─────────────────────┘                  ▼
+#ifdef __aarch64__
+  if (atomic_load(&__libc_memtag_stack)) {
+    size_t distance = reinterpret_cast<uintptr_t>(sp_dst) - reinterpret_cast<uintptr_t>(sp_src);
+    if (distance > kUntagLimit) {
+      async_safe_fatal(
+          "memtag_handle_longjmp: stack adjustment too large! %p -> %p, distance %zx > %zx\n",
+          sp_src, sp_dst, distance, kUntagLimit);
+    } else {
+      untag_memory(sp_src, sp_dst);
+    }
+  }
+#endif  // __aarch64__
+
+  // We can use __has_feature here rather than __hwasan_handle_longjmp as a
+  // weak symbol because this is part of libc which is always sanitized for a
+  // hwasan enabled process.
+#if __has_feature(hwaddress_sanitizer)
+  __hwasan_handle_longjmp(sp_dst);
+#endif  // __has_feature(hwaddress_sanitizer)
 }

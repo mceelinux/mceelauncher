@@ -94,16 +94,13 @@ void __FD_SET_chk(int fd, fd_set* set, size_t set_size) {
 }
 
 char* __fgets_chk(char* dst, int supplied_size, FILE* stream, size_t dst_len_from_compiler) {
-  if (supplied_size < 0) {
-    __fortify_fatal("fgets: buffer size %d < 0", supplied_size);
-  }
   __check_buffer_access("fgets", "write into", supplied_size, dst_len_from_compiler);
   return fgets(dst, supplied_size, stream);
 }
 
 size_t __fread_chk(void* buf, size_t size, size_t count, FILE* stream, size_t buf_size) {
-  size_t total;
-  if (__predict_false(__size_mul_overflow(size, count, &total))) {
+  unsigned long total;
+  if (__predict_false(__builtin_umull_overflow(size, count, &total))) {
     // overflow: trigger the error path in fread
     return fread(buf, size, count, stream);
   }
@@ -112,8 +109,8 @@ size_t __fread_chk(void* buf, size_t size, size_t count, FILE* stream, size_t bu
 }
 
 size_t __fwrite_chk(const void* buf, size_t size, size_t count, FILE* stream, size_t buf_size) {
-  size_t total;
-  if (__predict_false(__size_mul_overflow(size, count, &total))) {
+  unsigned long total;
+  if (__predict_false(__builtin_umull_overflow(size, count, &total))) {
     // overflow: trigger the error path in fwrite
     return fwrite(buf, size, count, stream);
   }
@@ -491,15 +488,6 @@ extern "C" char* __STRCPY_CHK(char* dst, const char* src, size_t dst_len) {
   __check_buffer_access("strcpy", "write into", src_len, dst_len);
   return strcpy(dst, src);
 }
-
-#if !defined(NO___MEMCPY_CHK)
-// Runtime implementation of __memcpy_chk (used directly by compiler, not in headers).
-extern "C" void* __memcpy_chk(void* dst, const void* src, size_t count, size_t dst_len) {
-  __check_count("memcpy", "count", count);
-  __check_buffer_access("memcpy", "write into", count, dst_len);
-  return memcpy(dst, src, count);
-}
-#endif // NO___MEMCPY_CHK
 
 // Runtime implementation of __mempcpy_chk (used directly by compiler, not in headers).
 extern "C" void* __mempcpy_chk(void* dst, const void* src, size_t count, size_t dst_len) {

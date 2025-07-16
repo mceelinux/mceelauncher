@@ -33,9 +33,11 @@
 #include <string.h>
 #include <sys/mman.h>
 
+#include "platform/bionic/mte.h"
+#include "private/ScopedRWLock.h"
+#include "private/ScopedSignalBlocker.h"
 #include "private/bionic_constants.h"
 #include "private/bionic_defs.h"
-#include "private/ScopedSignalBlocker.h"
 #include "pthread_internal.h"
 
 extern "C" __noreturn void _exit_with_stack_teardown(void*, size_t);
@@ -66,7 +68,7 @@ void __pthread_cleanup_pop(__pthread_cleanup_t* c, int execute) {
 }
 
 __BIONIC_WEAK_FOR_NATIVE_BRIDGE
-void pthread_exit(void* return_value) {
+__attribute__((no_sanitize("memtag"))) void pthread_exit(void* return_value) {
   // Call dtors for thread_local objects first.
   __cxa_thread_finalize();
 
@@ -103,16 +105,24 @@ void pthread_exit(void* return_value) {
          !atomic_compare_exchange_weak(&thread->join_state, &old_state, THREAD_EXITED_NOT_JOINED)) {
   }
 
-  // We don't want to take a signal after unmapping the stack, the shadow call
-  // stack, or dynamic TLS memory.
-  ScopedSignalBlocker ssb;
+  // android_run_on_all_threads() needs to see signals blocked atomically with setting the
+  // terminating flag, so take the creation lock while doing these operations.
+  {
+    ScopedReadLock locker(&g_thread_creation_lock);
+    atomic_store(&thread->terminating, true);
 
-#ifdef __aarch64__
+    // We don't want to take a signal after unmapping the stack, the shadow call stack, or dynamic
+    // TLS memory.
+    sigset64_t set;
+    sigfillset64(&set);
+    __rt_sigprocmask(SIG_BLOCK, &set, nullptr, sizeof(sigset64_t));
+  }
+
+#if defined(__aarch64__) || defined(__riscv)
   // Free the shadow call stack and guard pages.
   munmap(thread->shadow_call_stack_guard_region, SCS_GUARD_REGION_SIZE);
 #endif
 
-  // Free the ELF TLS DTV and all dynamically-allocated ELF TLS memory.
   __free_dynamic_tls(__get_bionic_tcb());
 
   if (old_state == THREAD_DETACHED) {
@@ -124,17 +134,24 @@ void pthread_exit(void* return_value) {
 
     // pthread_internal_t is freed below with stack, not here.
     __pthread_internal_remove(thread);
-
-    if (thread->mmap_size != 0) {
-      // We need to free mapped space for detached threads when they exit.
-      // That's not something we can do in C.
-      __hwasan_thread_exit();
-      _exit_with_stack_teardown(thread->mmap_base, thread->mmap_size);
-    }
   }
 
-  // No need to free mapped space. Either there was no space mapped, or it is left for
-  // the pthread_join caller to clean up.
+  __notify_thread_exit_callbacks();
   __hwasan_thread_exit();
+
+#if defined(__aarch64__)
+  if (void* stack_mte_tls = thread->bionic_tcb->tls_slot(TLS_SLOT_STACK_MTE)) {
+    stack_mte_free_ringbuffer(reinterpret_cast<uintptr_t>(stack_mte_tls));
+  }
+#endif
+  // Everything below this line needs to be no_sanitize("memtag").
+
+  if (old_state == THREAD_DETACHED && thread->mmap_size != 0) {
+    // We need to free mapped space for detached threads when they exit.
+    // That's not something we can do in C.
+    _exit_with_stack_teardown(thread->mmap_base, thread->mmap_size);
+  }
+  // No need to free mapped space. Either there was no space mapped,
+  // or it is left for the pthread_join caller to clean up.
   __exit(0);
 }

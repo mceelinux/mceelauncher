@@ -38,6 +38,8 @@
 #define __hwasan_thread_exit()
 #endif
 
+#include "platform/bionic/page.h"
+
 #include "private/bionic_elf_tls.h"
 #include "private/bionic_lock.h"
 #include "private/bionic_tls.h"
@@ -70,9 +72,12 @@ class pthread_internal_t {
   pid_t tid;
 
  private:
-  pid_t cached_pid_;
+  uint32_t cached_pid_ : 31;
+  uint32_t vforked_ : 1;
 
  public:
+  bool is_vforked() { return vforked_; }
+
   pid_t invalidate_cached_pid() {
     pid_t old_value;
     get_cached_pid(&old_value);
@@ -102,9 +107,14 @@ class pthread_internal_t {
 
   void* alternate_signal_stack;
 
-  // The start address of the shadow call stack's guard region (arm64 only).
+  // The start address of the shadow call stack's guard region (arm64/riscv64).
+  // This region is SCS_GUARD_REGION_SIZE bytes large, but only SCS_SIZE bytes
+  // are actually used.
+  //
   // This address is only used to deallocate the shadow call stack on thread
-  // exit; the address of the stack itself is stored only in the x18 register.
+  // exit; the address of the stack itself is stored only in the register used
+  // as the shadow stack pointer (x18 on arm64, gp on riscv64).
+  //
   // Because the protection offered by SCS relies on the secrecy of the stack
   // address, storing the address here weakens the protection, but only
   // slightly, because it is relatively easy for an attacker to discover the
@@ -112,13 +122,24 @@ class pthread_internal_t {
   // to other allocations), but not the stack itself, which is <0.1% of the size
   // of the guard region.
   //
+  // longjmp()/setjmp() don't store all the bits of the shadow stack pointer,
+  // only the bottom bits covered by SCS_MASK. Since longjmp()/setjmp() between
+  // different threads is undefined behavior (and unsupported on Android), we
+  // can retrieve the high bits of the shadow stack pointer from the current
+  // value in the register --- all the jmp_buf needs to store is where exactly
+  // the shadow stack pointer is *within* the thread's shadow stack: the bottom
+  // bits of the register.
+  //
   // There are at least two other options for discovering the start address of
   // the guard region on thread exit, but they are not as simple as storing in
   // TLS.
-  // 1) Derive it from the value of the x18 register. This is only possible in
-  //    processes that do not contain legacy code that might clobber x18,
-  //    therefore each process must declare early during process startup whether
-  //    it might load legacy code.
+  //
+  // 1) Derive it from the current value of the shadow stack pointer. This is
+  //    only possible in processes that do not contain legacy code that might
+  //    clobber x18 on arm64, therefore each process must declare early during
+  //    process startup whether it might load legacy code.
+  //    TODO: riscv64 has no legacy code, so we can actually go this route
+  //    there, but hopefully we'll actually get the Zisslpcfi extension instead.
   // 2) Mark the guard region as such using prctl(PR_SET_VMA_ANON_NAME) and
   //    discover its address by reading /proc/self/maps. One issue with this is
   //    that reading /proc/self/maps can race with allocations, so we may need
@@ -128,6 +149,11 @@ class pthread_internal_t {
   // A pointer to the top of the stack. This lets android_unsafe_frame_pointer_chase determine the
   // top of the stack quickly, which would otherwise require special logic for the main thread.
   uintptr_t stack_top;
+
+  // Whether the thread is in the process of terminating (has blocked signals), or has already
+  // terminated. This is used by android_run_on_all_threads() to avoid sending a signal to a thread
+  // that will never receive it.
+  _Atomic(bool) terminating;
 
   Lock startup_handshake_lock;
 
@@ -152,6 +178,12 @@ class pthread_internal_t {
   bionic_tls* bionic_tls;
 
   int errno_value;
+
+  bionic_tcb* bionic_tcb;
+  char stack_mte_ringbuffer_vma_name_buffer[32];
+  bool should_allocate_stack_mte_ringbuffer;
+
+  bool is_main() { return start_routine == nullptr; }
 };
 
 struct ThreadMapping {
@@ -181,6 +213,10 @@ __LIBC_HIDDEN__ pthread_internal_t* __pthread_internal_find(pthread_t pthread_id
 __LIBC_HIDDEN__ pid_t __pthread_internal_gettid(pthread_t pthread_id, const char* caller);
 __LIBC_HIDDEN__ void __pthread_internal_remove(pthread_internal_t* thread);
 __LIBC_HIDDEN__ void __pthread_internal_remove_and_free(pthread_internal_t* thread);
+__LIBC_HIDDEN__ void __find_main_stack_limits(uintptr_t* low, uintptr_t* high);
+#if defined(__aarch64__)
+__LIBC_HIDDEN__ void* __allocate_stack_mte_ringbuffer(size_t n, pthread_internal_t* thread);
+#endif
 
 static inline __always_inline bionic_tcb* __get_bionic_tcb() {
   return reinterpret_cast<bionic_tcb*>(&__get_tls()[MIN_TLS_SLOT]);
@@ -204,15 +240,13 @@ static inline void __set_tcb_dtv(bionic_tcb* tcb, TlsDtv* val) {
   tcb->tls_slot(TLS_SLOT_DTV) = &val->generation;
 }
 
-extern "C" __LIBC_HIDDEN__ int __set_tls(void* ptr);
-
 __LIBC_HIDDEN__ void pthread_key_clean_all(void);
 
 // Address space is precious on LP32, so use the minimum unit: one page.
 // On LP64, we could use more but there's no obvious advantage to doing
 // so, and the various media processes use RLIMIT_AS as a way to limit
 // the amount of allocation they'll do.
-#define PTHREAD_GUARD_SIZE PAGE_SIZE
+#define PTHREAD_GUARD_SIZE max_android_page_size()
 
 // SIGSTKSZ (8KiB) is not big enough.
 // An snprintf to a stack buffer of size PATH_MAX consumes ~7KiB of stack.
@@ -239,3 +273,11 @@ __LIBC_HIDDEN__ void pthread_key_clean_all(void);
 __LIBC_HIDDEN__ extern void __bionic_atfork_run_prepare();
 __LIBC_HIDDEN__ extern void __bionic_atfork_run_child();
 __LIBC_HIDDEN__ extern void __bionic_atfork_run_parent();
+
+// Re-map all threads and successively launched threads with PROT_MTE. Returns 'true' if remapping
+// took place, 'false' on error or if the stacks were already remapped in the past.
+__LIBC_HIDDEN__ bool __pthread_internal_remap_stack_with_mte();
+
+extern "C" bool android_run_on_all_threads(bool (*func)(void*), void* arg);
+
+extern pthread_rwlock_t g_thread_creation_lock;

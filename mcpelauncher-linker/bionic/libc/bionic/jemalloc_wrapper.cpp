@@ -15,13 +15,25 @@
  */
 
 #include <errno.h>
+#include <inttypes.h>
 #include <malloc.h>
 #include <sys/param.h>
 #include <unistd.h>
 
+#include <async_safe/log.h>
 #include <private/MallocXmlElem.h>
 
 #include "jemalloc.h"
+
+__BEGIN_DECLS
+
+size_t je_mallinfo_narenas();
+size_t je_mallinfo_nbins();
+struct mallinfo je_mallinfo_arena_info(size_t);
+struct mallinfo je_mallinfo_bin_info(size_t, size_t);
+void je_stats_arena(size_t arena_index, void (*callback)(size_t, size_t, size_t));
+
+__END_DECLS
 
 void* je_pvalloc(size_t bytes) {
   size_t pagesize = getpagesize();
@@ -67,9 +79,13 @@ void* je_aligned_alloc_wrapper(size_t alignment, size_t size) {
 int je_mallopt(int param, int value) {
   // The only parameter we currently understand is M_DECAY_TIME.
   if (param == M_DECAY_TIME) {
-    // Only support setting the value to 1 or 0.
+    // Only support setting the value to -1 or 0 or 1.
     ssize_t decay_time_ms;
-    if (value) {
+    if (value < 0) {
+      // Given that SSIZE_MAX may not be supported in jemalloc, set this to a
+      // sufficiently large number that essentially disables the decay timer.
+      decay_time_ms = 10000000;
+    } else if (value) {
       decay_time_ms = 1000;
     } else {
       decay_time_ms = 0;
@@ -102,7 +118,7 @@ int je_mallopt(int param, int value) {
       }
     }
     return 1;
-  } else if (param == M_PURGE) {
+  } else if (param == M_PURGE || param == M_PURGE_ALL) {
     // Only clear the current thread cache since there is no easy way to
     // clear the caches of other threads.
     // This must be done first so that cleared allocations get purged
@@ -121,18 +137,30 @@ int je_mallopt(int param, int value) {
       return 0;
     }
     return 1;
+  } else if (param == M_LOG_STATS) {
+    size_t total_bytes = 0;
+    for (size_t i = 0; i < je_mallinfo_narenas(); i++) {
+      struct mallinfo mi = je_mallinfo_arena_info(i);
+      size_t arena_bytes = mi.fsmblks + mi.ordblks + mi.uordblks;
+      async_safe_format_log(ANDROID_LOG_INFO, "jemalloc",
+                            "Arena %zu: bin bytes=%zu large bytes=%zu total bytes=%zu", i,
+                            mi.fsmblks, mi.ordblks, arena_bytes);
+
+      je_stats_arena(i, [](size_t index, size_t size, size_t allocs) {
+        if (allocs != 0) {
+          async_safe_format_log(ANDROID_LOG_INFO, "jemalloc",
+                                "  Size Class %zu(%zu bytes): allocs=%zu total bytes=%zu", index,
+                                size, allocs, allocs * size);
+        }
+      });
+      total_bytes += arena_bytes;
+    }
+    async_safe_format_log(ANDROID_LOG_INFO, "jemalloc", "Total Bytes=%zu", total_bytes);
+    return 1;
   }
+
   return 0;
 }
-
-__BEGIN_DECLS
-
-size_t je_mallinfo_narenas();
-size_t je_mallinfo_nbins();
-struct mallinfo je_mallinfo_arena_info(size_t);
-struct mallinfo je_mallinfo_bin_info(size_t, size_t);
-
-__END_DECLS
 
 int je_malloc_info(int options, FILE* fp) {
   if (options != 0) {

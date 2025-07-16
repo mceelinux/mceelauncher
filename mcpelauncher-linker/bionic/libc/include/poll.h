@@ -44,7 +44,7 @@ __BEGIN_DECLS
 typedef unsigned int nfds_t;
 
 /**
- * [poll(3)](http://man7.org/linux/man-pages/man3/poll.3.html) waits on a set of file descriptors.
+ * [poll(3)](https://man7.org/linux/man-pages/man3/poll.3.html) waits on a set of file descriptors.
  *
  * Returns the number of ready file descriptors on success, 0 for timeout,
  * and returns -1 and sets `errno` on failure.
@@ -52,21 +52,23 @@ typedef unsigned int nfds_t;
 int poll(struct pollfd* _Nullable __fds, nfds_t __count, int __timeout_ms);
 
 /**
- * [ppoll(3)](http://man7.org/linux/man-pages/man3/ppoll.3.html) waits on a set of file descriptors
+ * [ppoll(3)](https://man7.org/linux/man-pages/man3/ppoll.3.html) waits on a set of file descriptors
  * or a signal. Set `__timeout` to null for no timeout. Set `__mask` to null to not set the signal
  * mask.
  *
  * Returns the number of ready file descriptors on success, 0 for timeout,
  * and returns -1 and sets `errno` on failure.
- *
- * Available since API level 28.
  */
-int ppoll(struct pollfd* _Nullable __fds, nfds_t __count, const struct timespec* _Nullable __timeout, const sigset_t* _Nullable __mask) __INTRODUCED_IN(21);
+int ppoll(struct pollfd* _Nullable __fds, nfds_t __count, const struct timespec* _Nullable __timeout, const sigset_t* _Nullable __mask);
 
 /**
  * Like ppoll() but allows setting a signal mask with RT signals even from a 32-bit process.
  */
+
+#if __BIONIC_AVAILABILITY_GUARD(28)
 int ppoll64(struct pollfd* _Nullable  __fds, nfds_t __count, const struct timespec* _Nullable __timeout, const sigset64_t* _Nullable __mask) __INTRODUCED_IN(28);
+#endif /* __BIONIC_AVAILABILITY_GUARD(28) */
+
 
 #if defined(__BIONIC_INCLUDE_FORTIFY_HEADERS)
 #define _POLL_H_

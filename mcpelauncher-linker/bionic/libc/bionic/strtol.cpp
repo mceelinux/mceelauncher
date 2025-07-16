@@ -32,131 +32,91 @@
 #include <inttypes.h>
 #include <limits.h>
 #include <stdlib.h>
+#include <wchar.h>
 
-template <typename T, T Min, T Max> T StrToI(const char* nptr, char** endptr, int base) {
+template <typename T, T Min, T Max, typename CharT>
+__attribute__((always_inline)) T StrToI(const CharT* s, CharT** end_ptr, int base) {
   // Ensure that base is between 2 and 36 inclusive, or the special value of 0.
   if (base < 0 || base == 1 || base > 36) {
-    if (endptr != nullptr) *endptr = const_cast<char*>(nptr);
+    if (end_ptr != nullptr) *end_ptr = const_cast<CharT*>(s);
     errno = EINVAL;
     return 0;
   }
 
   // Skip white space and pick up leading +/- sign if any.
-  // If base is 0, allow 0x for hex and 0 for octal, else
-  // assume decimal; if base is already 16, allow 0x.
-  const char* s = nptr;
+  const CharT* p = s;
   int c;
-  do {
-    c = *s++;
-  } while (isspace(c));
-  int neg;
-  if (c == '-') {
-    neg = 1;
-    c = *s++;
-  } else {
-    neg = 0;
-    if (c == '+') c = *s++;
+  while (isspace(c = *p++)) {
   }
-  if ((base == 0 || base == 16) && c == '0' && (*s == 'x' || *s == 'X') && isxdigit(s[1])) {
-    c = s[1];
-    s += 2;
+  bool neg = false;
+  if (c == '-') {
+    neg = true;
+    c = *p++;
+  } else if (c == '+') {
+    c = *p++;
+  }
+
+  // If base is 0 or 16, allow "0x" prefix for hex.
+  if ((base == 0 || base == 16) && c == '0' && (*p == 'x' || *p == 'X') && isxdigit(p[1])) {
+    c = p[1];
+    p += 2;
     base = 16;
   }
+  // If base is 0 or 2, allow "0b" prefix for binary.
+  if ((base == 0 || base == 2) && c == '0' && (*p == 'b' || *p == 'B') && isdigit(p[1])) {
+    c = p[1];
+    p += 2;
+    base = 2;
+  }
+  // If base is 0, allow "0" prefix for octal, otherwise base is 10.
   if (base == 0) base = (c == '0') ? 8 : 10;
 
-  // We always work in the negative space because the most negative value has a
-  // larger magnitude than the most positive value.
-  T cutoff = Min / base;
-  int cutlim = -(Min % base);
+  constexpr bool is_signed = (Min != 0);
+  T acc = 0;
   // Non-zero if any digits consumed; negative to indicate overflow/underflow.
   int any = 0;
-  T acc = 0;
-  for (; ; c = *s++) {
+  for (;; c = *p++) {
     if (isdigit(c)) {
       c -= '0';
     } else if (isalpha(c)) {
-      c -= isupper(c) ? 'A' - 10 : 'a' - 10;
+      c = 10 + (_tolower(c) - 'a');
     } else {
       break;
     }
     if (c >= base) break;
     if (any < 0) continue;
-    if (acc < cutoff || (acc == cutoff && c > cutlim)) {
-      any = -1;
-      acc = Min;
-      errno = ERANGE;
+    if (is_signed) {
+      // We work in the negative space because the most negative value has a
+      // larger magnitude than the most positive value.
+      if (__builtin_mul_overflow(acc, base, &acc) || __builtin_sub_overflow(acc, c, &acc)) {
+        any = -1;
+        continue;
+      }
     } else {
-      any = 1;
-      acc *= base;
-      acc -= c;
+      if (__builtin_mul_overflow(acc, base, &acc) || __builtin_add_overflow(acc, c, &acc)) {
+        any = -1;
+        continue;
+      }
     }
-  }
-  if (endptr != nullptr) *endptr = const_cast<char*>(any ? s - 1 : nptr);
-  if (!neg) {
-    if (acc == Min) {
-      errno = ERANGE;
-      acc = Max;
-    } else {
-      acc = -acc;
-    }
-  }
-  return acc;
-}
-
-template <typename T, T Max> T StrToU(const char* nptr, char** endptr, int base) {
-  if (base < 0 || base == 1 || base > 36) {
-    if (endptr != nullptr) *endptr = const_cast<char*>(nptr);
-    errno = EINVAL;
-    return 0;
+    any = 1;
   }
 
-  const char* s = nptr;
-  int c;
-  do {
-    c = *s++;
-  } while (isspace(c));
-  int neg;
-  if (c == '-') {
-    neg = 1;
-    c = *s++;
-  } else {
-    neg = 0;
-    if (c == '+') c = *s++;
-  }
-  if ((base == 0 || base == 16) && c == '0' && (*s == 'x' || *s == 'X') && isxdigit(s[1])) {
-    c = s[1];
-    s += 2;
-    base = 16;
-  }
-  if (base == 0) base = (c == '0') ? 8 : 10;
+  if (end_ptr != nullptr) *end_ptr = const_cast<CharT*>(any ? p - 1 : s);
 
-  T cutoff = Max / static_cast<T>(base);
-  int cutlim = Max % static_cast<T>(base);
-  T acc = 0;
-  int any = 0;
-  for (; ; c = *s++) {
-    if (isdigit(c)) {
-      c -= '0';
-    } else if (isalpha(c)) {
-      c -= isupper(c) ? 'A' - 10 : 'a' - 10;
-    } else {
-      break;
-    }
-    if (c >= base) break;
-    if (any < 0) continue;
-    if (acc > cutoff || (acc == cutoff && c > cutlim)) {
-      any = -1;
-      acc = Max;
-      errno = ERANGE;
-    } else {
-      any = 1;
-      acc *= base;
-      acc += c;
-    }
+  // Detected overflow/underflow in the loop?
+  if (any == -1) {
+    errno = ERANGE;
+    return (is_signed && neg) ? Min : Max;
   }
-  if (neg && any > 0) acc = -acc;
-  if (endptr != nullptr) *endptr = const_cast<char*>(any ? s - 1 : nptr);
-  return acc;
+
+  // Will we overflow by trying to negate the most negative value?
+  if (any > 0 && is_signed && !neg && acc == Min) {
+    errno = ERANGE;
+    return Max;
+  }
+
+  if (is_signed) return neg ? acc : -acc;
+  return neg ? -acc : acc;
 }
 
 int atoi(const char* s) {
@@ -172,35 +132,57 @@ long long atoll(const char* s) {
 }
 
 intmax_t strtoimax(const char* s, char** end, int base) {
-  return StrToI<intmax_t, INTMAX_MIN, INTMAX_MAX>(s, end, base);
+  return StrToI<intmax_t, INTMAX_MIN, INTMAX_MAX, char>(s, end, base);
+}
+
+intmax_t wcstoimax(const wchar_t* s, wchar_t** end, int base) {
+  return StrToI<intmax_t, INTMAX_MIN, INTMAX_MAX, wchar_t>(s, end, base);
 }
 
 long strtol(const char* s, char** end, int base) {
-  return StrToI<long, LONG_MIN, LONG_MAX>(s, end, base);
+  return StrToI<long, LONG_MIN, LONG_MAX, char>(s, end, base);
 }
+__strong_alias(strtol_l, strtol);
+
+long wcstol(const wchar_t* s, wchar_t** end, int base) {
+  return StrToI<long, LONG_MIN, LONG_MAX, wchar_t>(s, end, base);
+}
+__strong_alias(wcstol_l, wcstol);
 
 long long strtoll(const char* s, char** end, int base) {
-  return StrToI<long long, LLONG_MIN, LLONG_MAX>(s, end, base);
+  return StrToI<long long, LLONG_MIN, LLONG_MAX, char>(s, end, base);
 }
+__strong_alias(strtoll_l, strtoll);
 
-// Public API since L, but not in any header.
-extern "C" long long strtoq(const char* s, char** end, int base) {
-  return strtoll(s, end, base);
+long long wcstoll(const wchar_t* s, wchar_t** end, int base) {
+  return StrToI<long long, LLONG_MIN, LLONG_MAX, wchar_t>(s, end, base);
 }
+__strong_alias(wcstoll_l, wcstoll);
 
 unsigned long strtoul(const char* s, char** end, int base) {
-  return StrToU<unsigned long, ULONG_MAX>(s, end, base);
+  return StrToI<unsigned long, 0, ULONG_MAX, char>(s, end, base);
 }
+__strong_alias(strtoul_l, strtoul);
+
+unsigned long wcstoul(const wchar_t* s, wchar_t** end, int base) {
+  return StrToI<unsigned long, 0, ULONG_MAX, wchar_t>(s, end, base);
+}
+__strong_alias(wcstoul_l, wcstoul);
 
 unsigned long long strtoull(const char* s, char** end, int base) {
-  return StrToU<unsigned long long, ULLONG_MAX>(s, end, base);
+  return StrToI<unsigned long long, 0, ULLONG_MAX, char>(s, end, base);
 }
+__strong_alias(strtoull_l, strtoull);
+
+unsigned long long wcstoull(const wchar_t* s, wchar_t** end, int base) {
+  return StrToI<unsigned long long, 0, ULLONG_MAX, wchar_t>(s, end, base);
+}
+__strong_alias(wcstoull_l, wcstoull);
 
 uintmax_t strtoumax(const char* s, char** end, int base) {
-  return StrToU<uintmax_t, UINTMAX_MAX>(s, end, base);
+  return StrToI<uintmax_t, 0, UINTMAX_MAX, char>(s, end, base);
 }
 
-// Public API since L, but not in any header.
-extern "C" unsigned long long strtouq(const char* s, char** end, int base) {
-  return strtoull(s, end, base);
+uintmax_t wcstoumax(const wchar_t* s, wchar_t** end, int base) {
+  return StrToI<uintmax_t, 0, UINTMAX_MAX, wchar_t>(s, end, base);
 }

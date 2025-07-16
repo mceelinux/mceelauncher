@@ -40,13 +40,15 @@
 __BEGIN_DECLS
 
 /**
- * [adjtimex(2)](http://man7.org/linux/man-pages/man2/adjtimex.2.html) adjusts the kernel clock.
+ * [adjtimex(2)](https://man7.org/linux/man-pages/man2/adjtimex.2.html) adjusts the kernel clock.
  *
  * Returns the clock state on success, and returns -1 and sets `errno` on failure.
  *
  * Available since API level 24.
  */
-int adjtimex(struct timex* __buf) __INTRODUCED_IN(24);
+
+#if __BIONIC_AVAILABILITY_GUARD(24)
+int adjtimex(struct timex* _Nonnull __buf) __INTRODUCED_IN(24);
 
 /**
  * clock_adjtime adjusts a specific kernel clock.
@@ -55,6 +57,8 @@ int adjtimex(struct timex* __buf) __INTRODUCED_IN(24);
  *
  * Available since API level 24.
  */
-int clock_adjtime(clockid_t __clock, struct timex* __tx) __INTRODUCED_IN(24);
+int clock_adjtime(clockid_t __clock, struct timex* _Nonnull __tx) __INTRODUCED_IN(24);
+#endif /* __BIONIC_AVAILABILITY_GUARD(24) */
+
 
 __END_DECLS

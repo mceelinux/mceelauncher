@@ -57,11 +57,11 @@ struct utsname {
 };
 
 /**
- * [uname(2)](http://man7.org/linux/man-pages/man2/uname.2.html) returns information
+ * [uname(2)](https://man7.org/linux/man-pages/man2/uname.2.html) returns information
  * about the kernel.
  *
  * Returns 0 on success, and returns -1 and sets `errno` on failure.
  */
-int uname(struct utsname* __buf);
+int uname(struct utsname* _Nonnull __buf);
 
 __END_DECLS

@@ -28,9 +28,12 @@
 
 #include <android/set_abort_message.h>
 
+#include <async_safe/log.h>
+
+#include <bits/stdatomic.h>
 #include <pthread.h>
-#include <stdint.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
@@ -77,6 +80,10 @@ void android_set_abort_message(const char* msg) {
     return;
   }
 
+  if (msg == nullptr) {
+    msg = "(null)";
+  }
+
   size_t size = sizeof(magic_abort_msg_t) + strlen(msg) + 1;
   void* map = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
   if (map == MAP_FAILED) {
@@ -85,7 +92,7 @@ void android_set_abort_message(const char* msg) {
 
   // Name the abort message mapping to make it easier for tools to find the
   // mapping.
-  
+  prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, map, size, "abort message");
 
   magic_abort_msg_t* new_magic_abort_message = reinterpret_cast<magic_abort_msg_t*>(map);
   fill_abort_message_magic(new_magic_abort_message);

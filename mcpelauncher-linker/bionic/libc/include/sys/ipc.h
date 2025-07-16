@@ -47,11 +47,11 @@
 __BEGIN_DECLS
 
 /**
- * [ftok(3)](http://man7.org/linux/man-pages/man3/ftok.3.html) converts a path and id to a
+ * [ftok(3)](https://man7.org/linux/man-pages/man3/ftok.3.html) converts a path and id to a
  * System V IPC key.
  *
  * Returns a key on success, and returns -1 and sets `errno` on failure.
  */
-key_t ftok(const char* __path, int __id);
+key_t ftok(const char* _Nonnull __path, int __id);
 
 __END_DECLS

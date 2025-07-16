@@ -33,17 +33,17 @@
 __BEGIN_DECLS
 
 /**
- * [getopt(3)](http://man7.org/linux/man-pages/man3/getopt.3.html) parses command-line options.
+ * [getopt(3)](https://man7.org/linux/man-pages/man3/getopt.3.html) parses command-line options.
  *
  * Returns the next option character on success, returns -1 if all options have been parsed, and
  * returns `'?'` on error.
  */
-int getopt(int __argc, char* const __argv[], const char* __options);
+int getopt(int __argc, char* const _Nonnull __argv[_Nullable], const char* _Nonnull __options);
 
 /**
  * Points to the text of the corresponding value for options that take an argument.
  */
-extern char* optarg;
+extern char* _Nullable optarg;
 
 /**
  * The index of the next element to be processed.

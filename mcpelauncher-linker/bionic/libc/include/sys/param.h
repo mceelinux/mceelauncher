@@ -33,16 +33,20 @@
  * @brief Various macros.
  */
 
+#include <sys/cdefs.h>
+
 #include <endian.h>
 #include <limits.h>
 #include <linux/param.h>
-#include <sys/cdefs.h>
 
 /** The unit of `st_blocks` in `struct stat`. */
 #define DEV_BSIZE 512
 
-/** A historical name for PATH_MAX. */
-#define MAXPATHLEN  PATH_MAX
+/** A historical name for PATH_MAX. Use PATH_MAX in new code. */
+#define MAXPATHLEN PATH_MAX
+
+/** A historical name for NGROUPS_MAX. Use NGROUPS_MAX in new code. */
+#define NGROUPS NGROUPS_MAX
 
 #define MAXSYMLINKS 8
 

@@ -206,12 +206,12 @@ static void __getifaddrs_callback(void* context, nlmsghdr* hdr) {
     new_addr->interface_index = static_cast<int>(msg->ifa_index);
 
     // If this is a known interface, copy what we already know.
+    // If we don't know about this interface yet, we try to resolve the name and flags using ioctl
+    // calls during postprocessing.
     if (known_addr != nullptr) {
       strcpy(new_addr->name, known_addr->name);
       new_addr->ifa.ifa_name = new_addr->name;
       new_addr->ifa.ifa_flags = known_addr->ifa.ifa_flags;
-    } else {
-      new_addr->ifa.ifa_flags = msg->ifa_flags;
     }
 
     // Go through the various bits of information and find the name, address
@@ -248,11 +248,20 @@ static void __getifaddrs_callback(void* context, nlmsghdr* hdr) {
   }
 }
 
-static void remove_nameless_interfaces(ifaddrs** list) {
+static void resolve_or_remove_nameless_interfaces(ifaddrs** list) {
   ifaddrs_storage* addr = reinterpret_cast<ifaddrs_storage*>(*list);
   ifaddrs_storage* prev_addr = nullptr;
   while (addr != nullptr) {
     ifaddrs* next_addr = addr->ifa.ifa_next;
+
+    // Try resolving interfaces without a name first.
+    if (strlen(addr->name) == 0) {
+      if (if_indextoname(addr->interface_index, addr->name) != nullptr) {
+        addr->ifa.ifa_name = addr->name;
+      }
+    }
+
+    // If the interface could not be resolved, remove it.
     if (strlen(addr->name) == 0) {
       if (prev_addr == nullptr) {
         *list = next_addr;
@@ -263,7 +272,30 @@ static void remove_nameless_interfaces(ifaddrs** list) {
     } else {
       prev_addr = addr;
     }
+
     addr = reinterpret_cast<ifaddrs_storage*>(next_addr);
+  }
+}
+
+static void get_interface_flags_via_ioctl(ifaddrs** list) {
+  ScopedFd s(socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0));
+  if (s.get() == -1) {
+    async_safe_format_log(ANDROID_LOG_ERROR, "libc",
+                          "socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC) failed in ifaddrs: %m");
+    return;
+  }
+
+  for (ifaddrs_storage* addr = reinterpret_cast<ifaddrs_storage*>(*list); addr != nullptr;
+       addr = reinterpret_cast<ifaddrs_storage*>(addr->ifa.ifa_next)) {
+    ifreq ifr = {};
+    strlcpy(ifr.ifr_name, addr->ifa.ifa_name, sizeof(ifr.ifr_name));
+    if (ioctl(s.get(), SIOCGIFFLAGS, &ifr) != -1) {
+      addr->ifa.ifa_flags = ifr.ifr_flags;
+    } else {
+      async_safe_format_log(ANDROID_LOG_ERROR, "libc",
+                            "ioctl(SIOCGIFFLAGS) for \"%s\" failed in ifaddrs: %m",
+                            addr->ifa.ifa_name);
+    }
   }
 }
 
@@ -273,14 +305,9 @@ int getifaddrs(ifaddrs** out) {
 
   // Open the netlink socket and ask for all the links and addresses.
   NetlinkConnection nc;
-  // Simulate kernel behavior on R and above: RTM_GETLINK messages can only be
-  // sent by:
-  // - System apps
-  // - Apps with a target SDK version lower than R
-  // TODO(b/141455849): Remove this check when kernel changes are merged.
+  // SELinux policy only allows RTM_GETLINK messages to be sent by system apps.
   bool getlink_success = false;
-  if (getuid() < FIRST_APPLICATION_UID ||
-      android_get_application_target_sdk_version() < __ANDROID_API_R__) {
+  if (getuid() < FIRST_APPLICATION_UID) {
     getlink_success = nc.SendRequest(RTM_GETLINK) && nc.ReadResponses(__getifaddrs_callback, out);
   }
   bool getaddr_success =
@@ -294,10 +321,12 @@ int getifaddrs(ifaddrs** out) {
   }
 
   if (!getlink_success) {
-    async_safe_format_log(ANDROID_LOG_INFO, "ifaddrs", "Failed to send RTM_GETLINK request");
     // If we weren't able to depend on GETLINK messages, it's possible some
-    // interfaces never got their name set. Remove those.
-    remove_nameless_interfaces(out);
+    // interfaces never got their name set. Resolve them using if_indextoname or remove them.
+    resolve_or_remove_nameless_interfaces(out);
+    // Similarly, without GETLINK messages, interfaces will not have their flags set.
+    // Resolve them using the SIOCGIFFLAGS ioctl call.
+    get_interface_flags_via_ioctl(out);
   }
 
   return 0;

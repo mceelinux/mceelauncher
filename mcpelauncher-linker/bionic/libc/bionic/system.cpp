@@ -38,7 +38,7 @@
 
 int system(const char* command) {
   // "The system() function shall always return non-zero when command is NULL."
-  // http://pubs.opengroup.org/onlinepubs/9699919799/functions/system.html
+  // https://pubs.opengroup.org/onlinepubs/9799919799.2024edition/functions/system.html
   if (command == nullptr) return 1;
 
   ScopedSignalBlocker sigchld_blocker(SIGCHLD);
@@ -56,7 +56,7 @@ int system(const char* command) {
   if ((errno = posix_spawnattr_setsigmask64(&attributes, &sigchld_blocker.old_set_))) return -1;
   if ((errno = posix_spawnattr_setflags(&attributes, flags))) return -1;
 
-  const char* argv[] = { "sh", "-c", command, nullptr };
+  const char* argv[] = {"sh", "-c", "--", command, nullptr};
   pid_t child;
   if ((errno = posix_spawn(&child, __bionic_get_shell_path(), nullptr, &attributes,
                            const_cast<char**>(argv), environ)) != 0) {

@@ -49,14 +49,12 @@ __BEGIN_DECLS
  *
  * @private
  */
-int* __errno(void) __attribute_const__;
+int* _Nonnull __errno(void) __attribute_const__;
 
 /**
- * [errno(3)](http://man7.org/linux/man-pages/man3/errno.3.html) is the last error on the calling
+ * [errno(3)](https://man7.org/linux/man-pages/man3/errno.3.html) is the last error on the calling
  * thread.
  */
 #define errno (*__errno())
 
 __END_DECLS
-
-#include <android/legacy_errno_inlines.h>

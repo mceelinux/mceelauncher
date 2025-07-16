@@ -45,12 +45,16 @@
 __BEGIN_DECLS
 
 /**
- * [quotactl(2)](http://man7.org/linux/man-pages/man2/quotactl.2.html) manipulates disk quotas.
+ * [quotactl(2)](https://man7.org/linux/man-pages/man2/quotactl.2.html) manipulates disk quotas.
  *
  * Returns 0 on success, and returns -1 and sets `errno` on failure.
  *
  * Available since API level 26.
  */
-int quotactl(int __cmd, const char* __special, int __id, char* __addr) __INTRODUCED_IN(26);
+
+#if __BIONIC_AVAILABILITY_GUARD(26)
+int quotactl(int __op, const char* _Nullable __special, int __id, char* __BIONIC_COMPLICATED_NULLNESS __addr) __INTRODUCED_IN(26);
+#endif /* __BIONIC_AVAILABILITY_GUARD(26) */
+
 
 __END_DECLS

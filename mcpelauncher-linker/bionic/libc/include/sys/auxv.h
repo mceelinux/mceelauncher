@@ -40,14 +40,12 @@
 __BEGIN_DECLS
 
 /**
- * [getauxval(3)](http://man7.org/linux/man-pages/man2/personality.2.html) returns values from
+ * [getauxval(3)](https://man7.org/linux/man-pages/man3/getauxval.3.html) returns values from
  * the ELF auxiliary vector passed by the kernel.
  *
  * Returns the corresponding value on success,
  * and returns 0 and sets `errno` to `ENOENT` on failure.
- *
- * Available since API level 18.
  */
-unsigned long int getauxval(unsigned long int __type) __INTRODUCED_IN(18);
+unsigned long int getauxval(unsigned long int __type);
 
 __END_DECLS

@@ -39,13 +39,15 @@
  *   all dynamic linking has been performed.
  */
 
+#include <elf.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <stdint.h>
-#include <elf.h>
+#include "bionic/pthread_internal.h"
 #include "libc_init_common.h"
 
+#include "private/bionic_defs.h"
 #include "private/bionic_elf_tls.h"
 #include "private/bionic_globals.h"
 #include "platform/bionic/macros.h"
@@ -57,6 +59,12 @@ extern "C" {
   extern void netdClientInit(void);
   extern int __cxa_atexit(void (*)(void *), void *, void *);
 };
+
+void memtag_stack_dlopen_callback() {
+  if (__pthread_internal_remap_stack_with_mte()) {
+    async_safe_format_log(ANDROID_LOG_DEBUG, "libc", "remapped stacks as PROT_MTE");
+  }
+}
 
 // Use an initializer so __libc_sysinfo will have a fallback implementation
 // while .preinit_array constructors run.
@@ -90,6 +98,16 @@ static void __libc_preinit_impl() {
 
   __libc_init_globals();
   __libc_init_common();
+  __libc_init_scudo();
+
+#if __has_feature(hwaddress_sanitizer)
+  // Notify the HWASan runtime library whenever a library is loaded or unloaded
+  // so that it can update its shadow memory.
+  // This has to happen before _libc_init_malloc which might dlopen to load
+  // profiler libraries.
+  __libc_shared_globals()->load_hook = __hwasan_library_loaded;
+  __libc_shared_globals()->unload_hook = __hwasan_library_unloaded;
+#endif
 
   // Hooks for various libraries to let them know that we're starting up.
   __libc_globals.mutate(__libc_init_malloc);
@@ -99,12 +117,7 @@ static void __libc_preinit_impl() {
 
   __libc_init_fork_handler();
 
-#if __has_feature(hwaddress_sanitizer)
-  // Notify the HWASan runtime library whenever a library is loaded or unloaded
-  // so that it can update its shadow memory.
-  __libc_shared_globals()->load_hook = __hwasan_library_loaded;
-  __libc_shared_globals()->unload_hook = __hwasan_library_unloaded;
-#endif
+  __libc_shared_globals()->set_target_sdk_version_hook = __libc_set_target_sdk_version;
 
   netdClientInit();
 }
@@ -147,6 +160,12 @@ __noreturn void __libc_init(void* raw_args,
   if (structors->fini_array) {
     __cxa_atexit(__libc_fini,structors->fini_array,nullptr);
   }
+
+  __libc_init_mte_late();
+
+  // This roundabout way is needed so we don't use the static libc linked into the linker, which
+  // will not affect the process.
+  __libc_shared_globals()->memtag_stack_dlopen_callback = memtag_stack_dlopen_callback;
 
   exit(slingshot(args.argc - __libc_shared_globals()->initial_linker_arg_count,
                  args.argv + __libc_shared_globals()->initial_linker_arg_count,

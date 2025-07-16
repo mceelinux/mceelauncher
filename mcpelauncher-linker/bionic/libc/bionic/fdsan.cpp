@@ -40,6 +40,7 @@
 #include <unistd.h>
 
 #include <async_safe/log.h>
+#include <platform/bionic/page.h>
 #include <platform/bionic/reserved_signals.h>
 #include <sys/system_properties.h>
 
@@ -80,13 +81,13 @@ FdEntry* FdTableImpl<inline_fds>::at(size_t idx) {
 
     size_t required_count = max - inline_fds;
     size_t required_size = sizeof(FdTableOverflow) + required_count * sizeof(FdEntry);
-    size_t aligned_size = __BIONIC_ALIGN(required_size, PAGE_SIZE);
+    size_t aligned_size = __BIONIC_ALIGN(required_size, page_size());
     size_t aligned_count = (aligned_size - sizeof(FdTableOverflow)) / sizeof(FdEntry);
 
     void* allocation =
         mmap(nullptr, aligned_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (allocation == MAP_FAILED) {
-      async_safe_fatal("fdsan: mmap failed: %s", strerror(errno));
+      async_safe_fatal("fdsan: mmap failed: %m");
     }
 
     FdTableOverflow* new_overflow = reinterpret_cast<FdTableOverflow*>(allocation);
@@ -101,7 +102,7 @@ FdEntry* FdTableImpl<inline_fds>::at(size_t idx) {
   }
 
   size_t offset = idx - inline_fds;
-  if (local_overflow->len < offset) {
+  if (local_overflow->len <= offset) {
     return nullptr;
   }
   return &local_overflow->entries[offset];
@@ -134,14 +135,6 @@ __printflike(1, 0) static void fdsan_error(const char* fmt, ...) {
 
   auto error_level = atomic_load(&fd_table.error_level);
   if (error_level == ANDROID_FDSAN_ERROR_LEVEL_DISABLED) {
-    return;
-  }
-
-  // Lots of code will (sensibly) fork, blindly call close on all of their fds,
-  // and then exec. Compare our cached pid value against the real one to detect
-  // this scenario and permit it.
-  pid_t cached_pid = __get_cached_pid();
-  if (cached_pid == 0 || cached_pid != syscall(__NR_getpid)) {
     return;
   }
 
@@ -224,6 +217,10 @@ const char* android_fdsan_get_tag_type(uint64_t tag) {
       return "SocketImpl";
     case ANDROID_FDSAN_OWNER_TYPE_ZIPARCHIVE:
       return "ZipArchive";
+    case ANDROID_FDSAN_OWNER_TYPE_NATIVE_HANDLE:
+      return "native_handle_t";
+    case ANDROID_FDSAN_OWNER_TYPE_PARCEL:
+      return "Parcel";
 
     case ANDROID_FDSAN_OWNER_TYPE_GENERIC_00:
     default:
@@ -246,6 +243,10 @@ uint64_t android_fdsan_get_tag_value(uint64_t tag) {
 }
 
 int android_fdsan_close_with_tag(int fd, uint64_t expected_tag) {
+  if (__get_thread()->is_vforked()) {
+    return __close(fd);
+  }
+
   FDTRACK_CLOSE(fd);
   FdEntry* fde = GetFdEntry(fd);
   if (!fde) {
@@ -296,6 +297,10 @@ uint64_t android_fdsan_get_owner_tag(int fd) {
 }
 
 void android_fdsan_exchange_owner_tag(int fd, uint64_t expected_tag, uint64_t new_tag) {
+  if (__get_thread()->is_vforked()) {
+    return;
+  }
+
   FdEntry* fde = GetFdEntry(fd);
   if (!fde) {
     return;
@@ -332,6 +337,10 @@ android_fdsan_error_level android_fdsan_get_error_level() {
 }
 
 android_fdsan_error_level android_fdsan_set_error_level(android_fdsan_error_level new_level) {
+  if (__get_thread()->is_vforked()) {
+    return android_fdsan_get_error_level();
+  }
+
   return atomic_exchange(&GetFdTable().error_level, new_level);
 }
 
